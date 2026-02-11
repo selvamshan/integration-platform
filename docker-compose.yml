@@ -1,0 +1,83 @@
+version: '3.8'
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    container_name: integration-nats
+    ports:
+      - "4222:4222"
+      - "8222:8222"
+    command: ["-js", "-m", "8222"]
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - integration-network
+
+  postgres:
+    image: postgres:15-alpine
+    container_name: integration-postgres
+    environment:
+      POSTGRES_DB: integration_platform
+      POSTGRES_USER: platform
+      POSTGRES_PASSWORD: platform123
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U platform"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - integration-network
+
+  control-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.control-plane
+    container_name: integration-control-plane
+    environment:
+      DATABASE_URL: postgresql://platform:platform123@postgres:5432/integration_platform
+      NATS_URL: nats://nats:4222
+      RUST_LOG: control_plane=debug,info
+    ports:
+      - "8081:8081"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+    networks:
+      - integration-network
+
+  data-plane:
+    build:
+      context: .
+      dockerfile: Dockerfile.data-plane
+    container_name: integration-data-plane
+    environment:
+      DATABASE_URL: postgresql://platform:platform123@postgres:5432/integration_platform
+      NATS_URL: nats://nats:4222
+      RUST_LOG: data_plane=debug,integration_runtime=debug,info
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      nats:
+        condition: service_healthy
+      control-plane:
+        condition: service_started
+    networks:
+      - integration-network
+
+volumes:
+  postgres_data:
+
+networks:
+  integration-network:
+    driver: bridge

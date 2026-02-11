@@ -1,0 +1,29 @@
+[workspace]
+members = [
+    "crates/data-plane",
+    "crates/control-plane",
+    "crates/integration-runtime",
+    "crates/common",
+]
+resolver = "2"
+
+[workspace.dependencies]
+tokio = { version = "1.35", features = ["full"] }
+axum = { version = "0.7", features = ["macros"] }
+hyper = { version = "1.0", features = ["full"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+anyhow = "1.0"
+thiserror = "1.0"
+uuid = { version = "1.6", features = ["serde", "v4"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
+tower = "0.4"
+tower-http = { version = "0.5", features = ["trace", "cors"] }
+reqwest = { version = "0.11", features = ["json"] }
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+async-nats = "0.33"
+futures = "0.3"

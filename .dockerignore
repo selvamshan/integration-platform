@@ -1,0 +1,6 @@
+target/
+.git/
+*.md
+test.sh
+build.sh
+.service-pids
