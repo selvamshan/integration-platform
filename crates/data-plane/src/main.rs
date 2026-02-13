@@ -14,7 +14,7 @@ use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use async_nats::Client as NatsClient;
 use futures::StreamExt;
 
-use common::{ConfigUpdate, FlowDefinition, Message, Connector};
+use common::{Message, FlowDefinition, ConfigUpdate, Connector};
 use integration_runtime::FlowExecutor;
 use integration_runtime::connectors::{http::HttpConnector, postgres::PostgresConnector};
 
@@ -22,6 +22,7 @@ struct AppState {
     executor: Arc<RwLock<FlowExecutor>>,
     flows: Arc<RwLock<std::collections::HashMap<String, FlowDefinition>>>,
     nats: NatsClient,
+    node_id: String,
 }
 
 #[tokio::main]
@@ -35,6 +36,11 @@ async fn main() -> Result<()> {
         .init();
 
     tracing::info!("🚀 Starting Data Plane with Event Subscription");
+
+    // Generate unique node ID
+    let node_id = format!("data-plane-{}", uuid::Uuid::new_v4());
+    tracing::info!("📋 Node ID: {}", node_id);
+
 
     // Connect to NATS
     let nats_url = std::env::var("NATS_URL")
@@ -50,7 +56,6 @@ async fn main() -> Result<()> {
     // Register HTTP connector
     let mut http_connector = HttpConnector::new();
     http_connector.connect().await?;
-    //http_connector.connect().await?;
     executor.register_connector("http".to_string(), Box::new(http_connector));
     
     // Register PostgreSQL connector
@@ -68,6 +73,7 @@ async fn main() -> Result<()> {
         executor: Arc::new(RwLock::new(executor)),
         flows: Arc::new(RwLock::new(std::collections::HashMap::new())),
         nats: nats.clone(),
+        node_id: node_id.clone(),
     });
 
     // Start NATS event listener
@@ -78,12 +84,19 @@ async fn main() -> Result<()> {
         }
     });
 
+        // Wait a moment for subscription to be ready
+    tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+
+    // Register with Control Plane to receive all flows
+    register_with_control_plane(state.clone()).await?;
+
     // Build router
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health_check))
         .route("/flows/:flow_id/execute", post(execute_flow))
         .route("/api/trigger/:path", get(trigger_flow))
+        .route("/flows", get(list_flows))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -94,6 +107,26 @@ async fn main() -> Result<()> {
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
+    Ok(())
+}
+
+async fn register_with_control_plane(state: Arc<AppState>) -> Result<()> {
+    tracing::info!("📡 Registering with Control Plane...");   
+    // Send registration message to Control Plane   
+    state.nats.publish(
+        "dataplane.register",
+        state.node_id.clone().into_bytes().into()
+    ).await?;
+    
+    tracing::info!("✅ Registration sent to Control Plane");
+    tracing::info!("⏳ Waiting for flows to be pushed from Control Plane...");
+    
+    // Wait a bit for flows to arrive
+    tokio::time::sleep(tokio::time::Duration::from_secs(2)).await;
+    
+    let flow_count = state.flows.read().await.len();
+    tracing::info!("✅ Received {} flows from Control Plane", flow_count);
+    
     Ok(())
 }
 
@@ -169,6 +202,16 @@ async fn health_check() -> Json<Value> {
         "status": "healthy",
         "service": "data-plane",
         "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+async fn list_flows(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let flows = state.flows.read().await;
+    let flow_list: Vec<&FlowDefinition> = flows.values().collect();
+    Json(json!({
+        "flows": flow_list,
+        "count": flows.len(),
+        "node_id": state.node_id
     }))
 }
 

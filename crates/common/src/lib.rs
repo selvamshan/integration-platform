@@ -59,6 +59,47 @@ pub trait Connector: Send + Sync {
     async fn disconnect(&mut self) -> Result<()>;
 }
 
+/// Connector definition for UI palette
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorDefinition {
+    pub id: String,
+    pub name: String,
+    pub connector_type: String,
+    pub description: String,
+    pub icon: Option<String>,
+    pub operations: Vec<ConnectorOperation>,
+    pub config_schema: serde_json::Value,
+    pub enabled: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorOperation {
+    pub name: String,
+    pub description: String,
+    pub parameters: Vec<OperationParameter>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationParameter {
+    pub name: String,
+    pub param_type: String,
+    pub required: bool,
+    pub description: String,
+    pub default_value: Option<serde_json::Value>,
+}
+
+/// Trigger definition for UI palette
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerDefinition {
+    pub id: String,
+    pub name: String,
+    pub trigger_type: String,
+    pub description: String,
+    pub icon: Option<String>,
+    pub config_schema: serde_json::Value,
+    pub enabled: bool,
+}
+
 /// Flow definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowDefinition {
@@ -121,7 +162,8 @@ pub enum ConfigUpdate {
     ApiCreated { api: ApiDefinition },
     ApiUpdated { api: ApiDefinition },
     ApiDeleted { api_id: String },
-    ConnectorRegistered { name: String, config: serde_json::Value },
+    ConnectorRegistered { connector: ConnectorDefinition },
+    TriggerRegistered { trigger: TriggerDefinition },
 }
 
 impl ConfigUpdate {
@@ -134,6 +176,7 @@ impl ConfigUpdate {
             ConfigUpdate::ApiUpdated { .. } => "config.api.updated",
             ConfigUpdate::ApiDeleted { .. } => "config.api.deleted",
             ConfigUpdate::ConnectorRegistered { .. } => "config.connector.registered",
+            ConfigUpdate::TriggerRegistered { .. } => "config.trigger.registered",
         }
     }
 }
