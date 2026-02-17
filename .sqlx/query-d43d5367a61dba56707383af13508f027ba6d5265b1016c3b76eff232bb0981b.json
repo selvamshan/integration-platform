@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO client_credentials (client_id, client_secret_hash, name, active, expires_at)\n         VALUES ($1, $2, $3, TRUE, $4)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Text",
+        "Varchar",
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d43d5367a61dba56707383af13508f027ba6d5265b1016c3b76eff232bb0981b"
+}

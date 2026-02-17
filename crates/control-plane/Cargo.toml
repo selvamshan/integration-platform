@@ -24,3 +24,6 @@ tower-http = { workspace = true }
 chrono = { workspace = true }
 async-nats = { workspace = true }
 futures = { workspace = true }
+redis = { workspace = true }
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace =true }

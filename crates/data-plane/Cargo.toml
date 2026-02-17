@@ -24,3 +24,10 @@ sqlx = { workspace = true }
 chrono = { workspace = true }
 async-nats = { workspace = true }
 futures = { workspace = true }
+redis = { workspace = true }
+tower = { workspace = true }
+prometheus = { workspace = true }
+lazy_static = { workspace = true }
+rand = { workspace = true }
+jsonwebtoken = { workspace = true }
+bcrypt = { workspace = true }

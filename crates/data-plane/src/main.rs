@@ -4,25 +4,198 @@ use axum::{
     routing::{get, post},
     extract::{State, Path, Json},
     response::{IntoResponse, Response},
-    http::StatusCode,
+    http::{StatusCode, Request, HeaderMap},
+    middleware::{self, Next},
+    body::Body,
 };
 use serde_json::{json, Value};
-use std::sync::Arc;
+use std::{arch::x86_64::CpuidResult, sync::Arc};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use async_nats::Client as NatsClient;
 use futures::StreamExt;
+use redis::AsyncCommands;
+use prometheus::{
+    Encoder, 
+    TextEncoder, 
+    Counter, 
+    Histogram, 
+    IntGauge, 
+    IntGaugeVec,
+    Registry, 
+    HistogramOpts, 
+    Opts,
+};
+use lazy_static::lazy_static;
 
-use common::{Message, FlowDefinition, ConfigUpdate, Connector};
+use common::{
+    Message, 
+    FlowDefinition, 
+    ConfigUpdate, 
+    Connector, 
+    RateLimitPolicy, 
+    RateLimitKeyType, 
+    RateLimitEvent,
+    CircuitBreakerPolicy, 
+    CircuitState,
+    RetryPolicy
+};
 use integration_runtime::FlowExecutor;
 use integration_runtime::connectors::{http::HttpConnector, postgres::PostgresConnector};
+
+mod retry;
+mod auth;
+//use retry::with_retry;
+use auth::{auth_middleware, AuthConfig};
+
+type RedisConnection = redis::aio::ConnectionManager;
+
+// Circuit breaker state tracking
+#[derive(Debug, Clone)]
+struct CircuitBreakerState {
+    state: CircuitState,
+    failure_count: u32,
+    success_count: u32,
+    last_failure_time: u64,
+    opened_at: u64,
+}
+
+impl CircuitBreakerState {
+    fn new() -> Self {
+        Self {
+            state: CircuitState::Closed,
+            failure_count: 0,
+            success_count: 0,
+            last_failure_time: 0,
+            opened_at: 0,
+        }
+    }
+}
+
+// Prometheus metrics
+lazy_static! {
+    static ref REGISTRY: Registry = Registry::new();
+    
+    static ref HTTP_REQUESTS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("http_requests_total", "Total number of HTTP requests")
+    ).unwrap();
+    
+    static ref HTTP_REQUEST_DURATION: Histogram = Histogram::with_opts(
+        HistogramOpts::new("http_request_duration_seconds", "HTTP request duration in seconds")
+            .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0])
+    ).unwrap();
+    
+    static ref FLOW_EXECUTIONS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("flow_executions_total", "Total number of flow executions")
+    ).unwrap();
+    
+    static ref FLOW_EXECUTIONS_SUCCESS: Counter = Counter::with_opts(
+        Opts::new("flow_executions_success_total", "Total number of successful flow executions")
+    ).unwrap();
+    
+    static ref FLOW_EXECUTIONS_FAILED: Counter = Counter::with_opts(
+        Opts::new("flow_executions_failed_total", "Total number of failed flow executions")
+    ).unwrap();
+    
+    static ref FLOW_EXECUTION_DURATION: Histogram = Histogram::with_opts(
+        HistogramOpts::new("flow_execution_duration_seconds", "Flow execution duration in seconds")
+            .buckets(vec![0.01, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0, 30.0, 60.0])
+    ).unwrap();
+    
+    static ref RATE_LIMIT_CHECKS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("rate_limit_checks_total", "Total number of rate limit checks")
+    ).unwrap();
+    
+    static ref RATE_LIMIT_BLOCKED_TOTAL: Counter = Counter::with_opts(
+        Opts::new("rate_limit_blocked_total", "Total number of blocked requests due to rate limiting")
+    ).unwrap();
+    
+    static ref RATE_LIMIT_ALLOWED_TOTAL: Counter = Counter::with_opts(
+        Opts::new("rate_limit_allowed_total", "Total number of allowed requests after rate limit check")
+    ).unwrap();
+    
+    static ref FLOWS_LOADED: IntGauge = IntGauge::with_opts(
+        Opts::new("flows_loaded", "Number of flows currently loaded")
+    ).unwrap();
+    
+    static ref REDIS_OPERATIONS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("redis_operations_total", "Total number of Redis operations")
+    ).unwrap();
+    
+    static ref REDIS_ERRORS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("redis_errors_total", "Total number of Redis errors")
+    ).unwrap();
+    
+    // Circuit breaker metrics
+    static ref CIRCUIT_BREAKER_STATE: IntGaugeVec = IntGaugeVec::new(
+        Opts::new("circuit_breaker_state", "Circuit breaker state by flow (0=closed, 1=open, 2=half_open)"),
+        &["flow_id"]
+    ).unwrap();
+    
+    static ref CIRCUIT_BREAKER_OPENS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("circuit_breaker_opens_total", "Total number of circuit breaker opens")
+    ).unwrap();
+    
+    static ref CIRCUIT_BREAKER_CLOSES_TOTAL: Counter = Counter::with_opts(
+        Opts::new("circuit_breaker_closes_total", "Total number of circuit breaker closes")
+    ).unwrap();
+    
+    static ref CIRCUIT_BREAKER_HALF_OPENS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("circuit_breaker_half_opens_total", "Total number of circuit breaker half-opens")
+    ).unwrap();
+    
+    static ref CIRCUIT_BREAKER_REJECTED_TOTAL: Counter = Counter::with_opts(
+        Opts::new("circuit_breaker_rejected_total", "Total number of requests rejected by circuit breaker")
+    ).unwrap();
+
+    // Retry metrics
+    static ref RETRY_ATTEMPTS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("retry_attempts_total", "Total number of retry attempts")
+    ).unwrap();
+    
+    static ref RETRY_SUCCESS_TOTAL: Counter = Counter::with_opts(
+        Opts::new("retry_success_total", "Total number of successful retries")
+    ).unwrap();
+    
+    static ref RETRY_EXHAUSTED_TOTAL: Counter = Counter::with_opts(
+        Opts::new("retry_exhausted_total", "Total number of exhausted retries")
+    ).unwrap();
+}
+
+fn register_metrics() {
+    REGISTRY.register(Box::new(HTTP_REQUESTS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(HTTP_REQUEST_DURATION.clone())).unwrap();
+    REGISTRY.register(Box::new(FLOW_EXECUTIONS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(FLOW_EXECUTIONS_SUCCESS.clone())).unwrap();
+    REGISTRY.register(Box::new(FLOW_EXECUTIONS_FAILED.clone())).unwrap();
+    REGISTRY.register(Box::new(FLOW_EXECUTION_DURATION.clone())).unwrap();
+    REGISTRY.register(Box::new(RATE_LIMIT_CHECKS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(RATE_LIMIT_BLOCKED_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(RATE_LIMIT_ALLOWED_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(FLOWS_LOADED.clone())).unwrap();
+    REGISTRY.register(Box::new(REDIS_OPERATIONS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(REDIS_ERRORS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(CIRCUIT_BREAKER_STATE.clone())).unwrap();
+    REGISTRY.register(Box::new(CIRCUIT_BREAKER_OPENS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(CIRCUIT_BREAKER_CLOSES_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(CIRCUIT_BREAKER_HALF_OPENS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(CIRCUIT_BREAKER_REJECTED_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(RETRY_ATTEMPTS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(RETRY_SUCCESS_TOTAL.clone())).unwrap();
+    REGISTRY.register(Box::new(RETRY_EXHAUSTED_TOTAL.clone())).unwrap();
+}
 
 struct AppState {
     executor: Arc<RwLock<FlowExecutor>>,
     flows: Arc<RwLock<std::collections::HashMap<String, FlowDefinition>>>,
+    circuit_breakers: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
     nats: NatsClient,
+    redis: RedisConnection,
     node_id: String,
+    jwt_secret: String,
 }
 
 #[tokio::main]
@@ -35,11 +208,24 @@ async fn main() -> Result<()> {
         .with(tracing_subscriber::fmt::layer())
         .init();
 
-    tracing::info!("🚀 Starting Data Plane with Event Subscription");
+    tracing::info!("🚀 Starting Data Plane with Metrics & Rate Limiting");
+
+    // Register Prometheus metrics
+    register_metrics();
+    tracing::info!("✅ Metrics registered");
 
     // Generate unique node ID
     let node_id = format!("data-plane-{}", uuid::Uuid::new_v4());
     tracing::info!("📋 Node ID: {}", node_id);
+    
+     // Connect to Redis
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://redis:6379".to_string());
+    
+    tracing::info!("Connecting to Redis at {}...", redis_url);
+    let redis_client = redis::Client::open(redis_url)?;
+    let redis = redis::aio::ConnectionManager::new(redis_client).await?;
+    tracing::info!("✅ Redis connected");
 
 
     // Connect to NATS
@@ -68,12 +254,18 @@ async fn main() -> Result<()> {
     
     tracing::info!("✅ Connectors initialized");
 
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "integration-platform-secret-change-in-production".to_string());
+
     // Create application state
     let state = Arc::new(AppState {
         executor: Arc::new(RwLock::new(executor)),
         flows: Arc::new(RwLock::new(std::collections::HashMap::new())),
+        circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
         nats: nats.clone(),
+        redis,
         node_id: node_id.clone(),
+        jwt_secret: jwt_secret.clone(),
     });
 
     // Start NATS event listener
@@ -90,24 +282,468 @@ async fn main() -> Result<()> {
     // Register with Control Plane to receive all flows
     register_with_control_plane(state.clone()).await?;
 
-    // Build router
-    let app = Router::new()
-        .route("/", get(root))
-        .route("/health", get(health_check))
+
+    // Auth config – shared by the auth middleware
+    let auth_cfg = Arc::new(AuthConfig {
+        jwt_secret,
+        nats: nats.clone(),
+    });
+
+    // Protected routes: require authentication
+    let protected = Router::new()
         .route("/flows/:flow_id/execute", post(execute_flow))
         .route("/api/trigger/:path", get(trigger_flow))
-        .route("/flows", get(list_flows))
+        .layer(middleware::from_fn_with_state(auth_cfg, auth_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), circuit_breaker_middleware))
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
+
+    // Public routes: no authentication required
+    let public = Router::new()
+        .route("/", get(root))
+        .route("/health", get(health_check))
+        .route("/metrics", get(metrics_handler))
+        .route("/circuit-breakers", get(circuit_breaker_status))
+        .route("/flows", get(list_flows));
+
+    let app = public
+        .merge(protected)
+        .layer(middleware::from_fn(metrics_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
     // Start server
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("🌐 Data Plane listening on {}", addr);
+    tracing::info!("📊 Metrics: http://{}:{}/metrics", addr.ip(), addr.port());
+    tracing::info!("🔌 Circuit Breakers: http://{}:{}/circuit-breakers", addr.ip(), addr.port());
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
 
     Ok(())
+}
+
+
+fn current_timestamp() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+}
+
+// Circuit breaker middleware
+async fn circuit_breaker_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let path = request.uri().path();
+    
+    // Extract flow ID
+    let flow_id = if path.starts_with("/flows/") && path.ends_with("/execute") {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 3 {
+            Some(parts[2].to_string())
+        } else {
+            None
+        }
+    } else if path.starts_with("/api/trigger/") {
+        // HTTP trigger: /api/trigger/{path}
+        let trigger_path = path.strip_prefix("/api/trigger/").unwrap_or("");
+        let flows = state.flows.read().await;
+        
+        // Find flow matching this trigger path
+        flows.values()
+            .find(|f| {
+                if let common::Trigger::Http { path: trigger_path_def, method } = &f.trigger {
+                    method == "GET" && trigger_path_def.contains(trigger_path)
+                } else {
+                    false
+                }
+            })
+            .map(|f| f.id.clone())
+    } else {
+        None
+    };
+
+    if let Some(ref flow_id_str) = flow_id {
+        let cb_policy = {
+            let flows = state.flows.read().await;
+
+            flows
+                .get(flow_id_str)
+                .and_then(|flow| flow.circuit_breaker.clone())
+        }; // flows dropped here automatically
+
+        if let Some(cb_policy) = cb_policy {
+            // Now safe — no borrow of flows exists
+
+            let mut circuit_breakers = state.circuit_breakers.write().await;
+            let cb_state = circuit_breakers
+                .entry(flow_id_str.clone())
+                .or_insert_with(CircuitBreakerState::new);
+
+            let now = current_timestamp();
+
+            match cb_state.state {
+                CircuitState::Open => {
+                    if now - cb_state.opened_at >= cb_policy.timeout_seconds {
+                        cb_state.state = CircuitState::HalfOpen;
+                        cb_state.success_count = 0;
+
+                        CIRCUIT_BREAKER_HALF_OPENS_TOTAL.inc();
+                        CIRCUIT_BREAKER_STATE
+                            .with_label_values(&[&flow_id_str.clone()])
+                            .set(2);
+
+                        tracing::info!(
+                            "🔄 Circuit breaker HALF-OPEN for flow: {}",
+                            flow_id_str.clone()
+                        );
+                    } else {
+                        CIRCUIT_BREAKER_REJECTED_TOTAL.inc();
+
+                        tracing::warn!(
+                            "🔌 Circuit breaker OPEN - rejecting request for flow: {}",
+                            flow_id_str
+                        );
+
+                        return (
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            Json(json!({
+                                "error": "Circuit breaker is open - service temporarily unavailable",
+                                "flow_id": flow_id_str,
+                                "state": "open",
+                                "retry_after_seconds":
+                                    cb_policy.timeout_seconds - (now - cb_state.opened_at)
+                            })),
+                        )
+                            .into_response();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+
+    next.run(request).await
+}
+
+async fn update_circuit_breaker_on_success(
+    state: Arc<AppState>,
+    flow_id: String,
+    policy: CircuitBreakerPolicy,
+) {
+    tokio::spawn(async move {
+        let mut circuit_breakers = state.circuit_breakers.write().await;
+
+        let cb_state = circuit_breakers
+            .entry(flow_id.clone())
+            .or_insert_with(CircuitBreakerState::new);
+
+        match cb_state.state {
+            CircuitState::HalfOpen => {
+                cb_state.success_count += 1;
+
+                if cb_state.success_count >= policy.success_threshold {
+                    cb_state.state = CircuitState::Closed;
+                    cb_state.failure_count = 0;
+                    cb_state.success_count = 0;
+
+                    CIRCUIT_BREAKER_CLOSES_TOTAL.inc();
+                    CIRCUIT_BREAKER_STATE
+                        .with_label_values(&[&flow_id])
+                        .set(0);
+
+                    tracing::info!(
+                        "✅ Circuit breaker CLOSED for flow: {}",
+                        flow_id
+                    );
+                }
+            }
+
+            CircuitState::Closed => {
+                cb_state.failure_count = 0;
+            }
+
+            _ => {}
+        }
+    });
+}
+
+
+async fn update_circuit_breaker_on_failure(
+    state: Arc<AppState>,
+    flow_id: String,
+    policy: CircuitBreakerPolicy,
+) {
+    tokio::spawn(async move {
+        let mut circuit_breakers = state.circuit_breakers.write().await;
+
+        let cb_state = circuit_breakers
+            .entry(flow_id.clone())
+            .or_insert_with(CircuitBreakerState::new);
+
+        let now = current_timestamp();
+
+        match cb_state.state {
+            CircuitState::Closed => {
+                cb_state.failure_count += 1;
+                cb_state.last_failure_time = now;
+
+                if cb_state.failure_count >= policy.failure_threshold {
+                    cb_state.state = CircuitState::Open;
+                    cb_state.opened_at = now;
+
+                    CIRCUIT_BREAKER_OPENS_TOTAL.inc();
+                    CIRCUIT_BREAKER_STATE
+                        .with_label_values(&[&flow_id])
+                        .set(1);
+
+                    tracing::error!(
+                        "🔴 Circuit breaker OPEN for flow: {} (failures: {})",
+                        flow_id,
+                        cb_state.failure_count
+                    );
+                }
+            }
+
+            CircuitState::HalfOpen => {
+                cb_state.state = CircuitState::Open;
+                cb_state.opened_at = now;
+                cb_state.success_count = 0;
+
+                CIRCUIT_BREAKER_OPENS_TOTAL.inc();
+                CIRCUIT_BREAKER_STATE
+                    .with_label_values(&[&flow_id])
+                    .set(1);
+
+                tracing::error!(
+                    "🔴 Circuit breaker re-OPEN for flow: {} (failed in half-open)",
+                    flow_id
+                );
+            }
+
+            _ => {}
+        }
+    });
+}
+
+// Circuit breaker status endpoint
+async fn circuit_breaker_status(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let circuit_breakers = state.circuit_breakers.read().await;
+    let flows = state.flows.read().await;
+    
+    let mut status = Vec::new();
+    
+    for (flow_id, cb_state) in circuit_breakers.iter() {
+        let policy = flows.get(flow_id).and_then(|f| f.circuit_breaker.as_ref());
+        
+        status.push(json!({
+            "flow_id": flow_id,
+            "state": match cb_state.state {
+                CircuitState::Closed => "closed",
+                CircuitState::Open => "open",
+                CircuitState::HalfOpen => "half_open",
+            },
+            "failure_count": cb_state.failure_count,
+            "success_count": cb_state.success_count,
+            "policy": policy
+        }));
+    }
+    
+    Json(json!({
+        "circuit_breakers": status,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+// Metrics middleware
+async fn metrics_middleware(
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let start = Instant::now();
+    let path = request.uri().path().to_string();
+    
+    HTTP_REQUESTS_TOTAL.inc();
+    
+    let response = next.run(request).await;
+    
+    let duration = start.elapsed().as_secs_f64();
+    HTTP_REQUEST_DURATION.observe(duration);
+    
+    tracing::debug!("Request to {} took {:.3}s", path, duration);
+    
+    response
+}
+
+// Metrics endpoint
+async fn metrics_handler() -> impl IntoResponse {
+    let encoder = TextEncoder::new();
+    let metric_families = REGISTRY.gather();
+    let mut buffer = Vec::new();
+    
+    if let Err(e) = encoder.encode(&metric_families, &mut buffer) {
+        tracing::error!("Failed to encode metrics: {}", e);
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "Failed to encode metrics".to_string(),
+        );
+    }
+    
+    match String::from_utf8(buffer) {
+        Ok(metrics) => (StatusCode::OK, metrics),
+        Err(e) => {
+            tracing::error!("Failed to convert metrics to string: {}", e);
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Failed to convert metrics".to_string(),
+            )
+        }
+    }
+}
+
+
+// Rate limiting middleware
+async fn rate_limit_middleware(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    // Extract client IP from headers (X-Forwarded-For or X-Real-IP) or use default
+    let client_ip = headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .or_else(|| headers.get("x-real-ip").and_then(|v| v.to_str().ok()))
+        .unwrap_or("unknown")
+        .to_string();
+    
+    // Extract flow ID from path
+    let path = request.uri().path();
+    let flow_id = if path.starts_with("/flows/") && path.ends_with("/execute") {
+        let parts: Vec<&str> = path.split('/').collect();
+        if parts.len() >= 3 {
+            Some(parts[2].to_string())
+        } else {
+            None
+        }
+    } else if path.starts_with("/api/trigger/") {
+        // For trigger endpoints, try to find matching flow
+        let trigger_path = path.strip_prefix("/api/trigger/").unwrap_or("");
+        let flows = state.flows.read().await;
+        flows.values()
+            .find(|f| {
+                if let common::Trigger::Http { path: trigger_path_def, method } = &f.trigger {
+                    method == "GET" && trigger_path_def.contains(trigger_path)
+                } else {
+                    false
+                }
+            })
+            .map(|f| f.id.clone())
+    } else {
+        None
+    };
+
+    // If we have a flow ID, check rate limit
+    if let Some(ref flow_id_str) = flow_id {
+        let flows = state.flows.read().await;
+        if let Some(flow) = flows.get(flow_id_str) {
+            if let Some(rate_limit) = &flow.rate_limit {
+                // Generate rate limit key based on policy
+                let key = generate_rate_limit_key(flow_id_str, rate_limit, &client_ip);
+                
+                // Check rate limit
+                match check_rate_limit(&state, flow_id_str, &key, rate_limit).await {
+                    Ok(allowed) => {
+                        if !allowed {
+                            tracing::warn!("🚫 Rate limit exceeded for flow {} (key: {})", flow_id_str, key);
+                            
+                            let message = rate_limit.message.as_ref()
+                                .map(|m| m.clone())
+                                .unwrap_or_else(|| format!("Rate limit exceeded: {} requests per {} seconds", 
+                                    rate_limit.max_requests, rate_limit.window_seconds));
+                            
+                            return (
+                                StatusCode::TOO_MANY_REQUESTS,
+                                Json(json!({
+                                    "error": message,
+                                    "flow_id": flow_id_str,
+                                    "limit": rate_limit.max_requests,
+                                    "window_seconds": rate_limit.window_seconds
+                                }))
+                            ).into_response();
+                        } else {
+                            tracing::debug!("✅ Rate limit check passed for flow {} (key: {})", flow_id_str, key);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("Rate limit check error: {}", e);
+                        // On error, allow the request (fail open)
+                    }
+                }
+            }
+        }
+    }
+
+    next.run(request).await
+}
+
+fn generate_rate_limit_key(flow_id: &str, policy: &RateLimitPolicy, client_ip: &str) -> String {
+    match policy.key_type {
+        RateLimitKeyType::Global => format!("ratelimit:global:{}", flow_id),
+        RateLimitKeyType::PerIp => format!("ratelimit:ip:{}:{}", client_ip, flow_id),
+        RateLimitKeyType::PerFlow => format!("ratelimit:flow:{}", flow_id),
+        RateLimitKeyType::PerUser => {
+            // TODO For now, use IP as user identifier (in real impl, extract from auth token)
+            format!("ratelimit:user:{}:{}", client_ip, flow_id)
+        }
+    }
+}
+
+async fn check_rate_limit(
+    state: &AppState,
+    flow_id: &str,
+    key: &str,
+    policy: &RateLimitPolicy,
+) -> Result<bool> {
+    let mut redis = state.redis.clone();
+    
+    // Use Redis INCR with EXPIRE for sliding window
+    let count: u32 = redis.incr(key, 1).await?;
+   // let count: u32 = redis.incr::<_, _, u32>(key, 1).await?;
+    
+    // Set expiry on first request
+    if count == 1 {
+        //redis.expire(key, policy.window_seconds as i64).await?;
+        let _: () = redis
+            .expire::<_, ()>(key, policy.window_seconds as i64)
+            .await?;
+    }
+    
+    let allowed = count <= policy.max_requests;
+    
+    // Send rate limit event to Control Plane
+    let event = RateLimitEvent {
+        flow_id: flow_id.to_string(),
+        key: key.to_string(),
+        timestamp: chrono::Utc::now(),
+        allowed,
+        current_count: count,
+        limit: policy.max_requests,
+    };
+    
+    // Publish to Control Plane (fire and forget)
+    let nats = state.nats.clone();
+    tokio::spawn(async move {
+        let payload = serde_json::to_vec(&event).unwrap();
+        let _ = nats.publish("ratelimit.event", payload.into()).await;
+    });
+    
+    Ok(allowed)
 }
 
 async fn register_with_control_plane(state: Arc<AppState>) -> Result<()> {
@@ -215,35 +851,141 @@ async fn list_flows(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+// Retry logic with exponential backoff
+async fn execute_with_retry<F, Fut>(
+    retry_policy: &common::RetryPolicy,
+    flow_id: &str,
+    mut operation: F,
+) -> Result<Message, common::Error>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<Message, common::Error>>,
+{
+    let mut attempt = 0;
+    let mut delay_ms = retry_policy.initial_delay_ms;
+    
+    loop {
+        attempt += 1;
+        
+        match operation().await {
+            Ok(result) => {
+                if attempt > 1 {
+                    RETRY_SUCCESS_TOTAL.inc();
+                    tracing::info!("✅ Flow {} succeeded on attempt {}/{}", 
+                        flow_id, attempt, retry_policy.max_attempts);
+                }
+                return Ok(result);
+            }
+            Err(e) => {
+                if attempt >= retry_policy.max_attempts {
+                    RETRY_EXHAUSTED_TOTAL.inc();
+                    tracing::error!("❌ Flow {} failed after {} attempts: {}", 
+                        flow_id, attempt, e);
+                    return Err(e);
+                }
+                
+                RETRY_ATTEMPTS_TOTAL.inc();
+                
+                // Calculate delay with exponential backoff
+                let actual_delay = if retry_policy.jitter {
+                    // Add jitter: 50-100% of calculated delay
+                    let jitter_factor = 0.5 + (rand::random::<f64>() * 0.5);
+                    (delay_ms as f64 * jitter_factor) as u64
+                } else {
+                    delay_ms
+                };
+                
+                tracing::warn!("🔄 Flow {} failed on attempt {}/{}, retrying in {}ms: {}", 
+                    flow_id, attempt, retry_policy.max_attempts, actual_delay, e);
+                
+                tokio::time::sleep(tokio::time::Duration::from_millis(actual_delay)).await;
+                
+                // Calculate next delay with backoff multiplier
+                delay_ms = ((delay_ms as f64) * retry_policy.backoff_multiplier) as u64;
+                delay_ms = delay_ms.min(retry_policy.max_delay_ms);
+            }
+        }
+    }
+}
+
+
 async fn execute_flow(
     State(state): State<Arc<AppState>>,
     Path(flow_id): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::info!("📨 Received request to execute flow: {}", flow_id);
+    tracing::info!("📨 Executing flow: {}", flow_id);
     
-    // Get flow from distributed state
+    FLOW_EXECUTIONS_TOTAL.inc();
+    let start = Instant::now();
+    
     let flow = {
         let flows = state.flows.read().await;
         flows.get(&flow_id).cloned()
     };
     
-    let flow = flow.ok_or_else(|| AppError::NotFound(format!("Flow not found: {}. Create it in Control Plane first.", flow_id)))?;
+    let flow = flow.ok_or_else(|| AppError::NotFound(format!("Flow not found: {}", flow_id)))?;
     
-    // Execute flow
+    let cb_policy = flow.circuit_breaker.clone();
+    let retry_policy = flow.retry.clone();
+
     let input = Message::new(payload);
     
-    let executor = state.executor.read().await;
-    let result = executor.execute_flow(&flow, input).await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    // Execute with retry if policy exists
+    let result = if let Some(ref policy) = retry_policy {
+        let executor = state.executor.clone();
+        let flow_clone = flow.clone();
+        let input_clone = input.clone();        
+        execute_with_retry(policy, &flow_id, move || {
+            let executor = executor.clone();
+            let flow = flow_clone.clone();
+            let input = input_clone.clone();            
+            async move {
+                let executor = executor.read().await;
+                executor.execute_flow(&flow, input).await
+            }
+        }).await
+    } else {
+        let executor = state.executor.read().await;
+        executor.execute_flow(&flow, input).await
+    };
     
-    Ok(Json(json!({
-        "flow_id": flow_id,
-        "flow_name": flow.name,
-        "status": "completed",
-        "result": result.payload,
-        "timestamp": result.timestamp
-    })))
+    let duration = start.elapsed().as_secs_f64();
+    FLOW_EXECUTION_DURATION.observe(duration);
+    
+    match result {
+        Ok(output) => {
+            FLOW_EXECUTIONS_SUCCESS.inc();
+            
+            // Update circuit breaker on success
+            if let Some(policy) = cb_policy {
+                update_circuit_breaker_on_success(state.clone(), flow_id.clone(), policy).await;
+            }
+            
+            tracing::info!("✅ Flow {} completed in {:.3}s", flow_id, duration);
+            
+            Ok(Json(json!({
+                "flow_id": flow_id,
+                "flow_name": flow.name,
+                "status": "completed",
+                "result": output.payload,
+                "timestamp": output.timestamp,
+                "duration_seconds": duration,
+                "node_id": state.node_id
+            })))
+        }
+        Err(e) => {
+            FLOW_EXECUTIONS_FAILED.inc();
+            
+            // Update circuit breaker on failure
+            if let Some(policy) = cb_policy {
+                update_circuit_breaker_on_failure(state.clone(), flow_id.clone(), policy).await;
+            }
+            
+            tracing::error!("❌ Flow {} failed after {:.3}s: {}", flow_id, duration, e);
+            Err(AppError::Internal(e.to_string()))
+        }
+    }
 }
 
 async fn trigger_flow(
@@ -251,8 +993,9 @@ async fn trigger_flow(
     Path(path): Path<String>,
 ) -> Result<Json<Value>, AppError> {
     tracing::info!("🎯 HTTP Trigger: GET /{}", path);
+    FLOW_EXECUTIONS_TOTAL.inc();
+    let start = Instant::now();
     
-    // Look for a flow with matching HTTP trigger
     let flow = {
         let flows = state.flows.read().await;
         flows.values()
@@ -269,23 +1012,65 @@ async fn trigger_flow(
     let flow = if let Some(f) = flow {
         f
     } else {
-        // If no flow found, create a default one (backward compatibility)
         tracing::warn!("No flow found for /{}, using default flow", path);
         create_default_flow(&path)
     };
     
-    // Execute flow
+    let flow_id = flow.id.clone();
+    let cb_policy = flow.circuit_breaker.clone(); 
+    let retry_policy = flow.retry.clone();       
+    
     let input = Message::new(json!({
         "trigger": "http",
         "path": format!("/{}", path),
         "method": "GET"
-    }));
+    }));    
+   
+    // Execute with retry if policy exists
+    let result = if let Some(ref policy) = retry_policy {
+        let executor = state.executor.clone();
+        let flow_clone = flow.clone();
+        let input_clone = input.clone();
+        
+        execute_with_retry(policy, &flow_id, move || {
+            let executor = executor.clone();
+            let flow = flow_clone.clone();
+            let input = input_clone.clone();
+            
+            async move {
+                let executor = executor.read().await;
+                executor.execute_flow(&flow, input).await
+            }
+        }).await
+    } else {
+        let executor = state.executor.read().await;
+        executor.execute_flow(&flow, input).await
+    };
     
-    let executor = state.executor.read().await;
-    let result = executor.execute_flow(&flow, input).await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
+    let duration = start.elapsed().as_secs_f64();
+    FLOW_EXECUTION_DURATION.observe(duration);
     
-    Ok(Json(result.payload))
+    match result {
+        Ok(output) => {
+            FLOW_EXECUTIONS_SUCCESS.inc();
+            if let Some(policy) = cb_policy {
+                update_circuit_breaker_on_success(state.clone(), flow_id.clone(), policy).await;
+            }
+            
+            tracing::info!("✅ Flow {} completed in {:.3}s", flow_id, duration);
+            Ok(Json(output.payload))
+        }
+        Err(e) => {
+            FLOW_EXECUTIONS_FAILED.inc();
+            // Update circuit breaker on failure
+            if let Some(policy) = cb_policy {
+                tracing::info!("{:?}", policy);
+                update_circuit_breaker_on_failure(state.clone(), flow_id.clone(), policy).await;
+            }
+            tracing::error!("❌ Flow {} failed after {:.3}s: {}", flow_id, duration, e);
+            Err(AppError::Internal(e.to_string()))
+        }
+    }
 }
 
 // Helper function for backward compatibility
@@ -317,6 +1102,14 @@ fn create_default_flow(path: &str) -> FlowDefinition {
                 message: "Returning data to client".to_string(),
             },
         ],
+        rate_limit: Some(RateLimitPolicy {
+            max_requests: 100,
+            window_seconds: 60,
+            key_type: RateLimitKeyType::PerIp,
+            message: None,
+        }),
+        circuit_breaker: None,
+        retry: None,
     }
 }
 

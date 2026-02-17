@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE client_credentials SET active = $1 WHERE client_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bool",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4f87d6bcd23fea3c0fe8eedbd84b1c332c66faf562675fd6625b97c9d61f2cb4"
+}

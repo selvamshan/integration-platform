@@ -59,6 +59,68 @@ pub trait Connector: Send + Sync {
     async fn disconnect(&mut self) -> Result<()>;
 }
 
+// ─── Auth ────────────────────────────────────────────────────────────────────
+
+/// Stored in PostgreSQL by the Control Plane
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientCredential {
+    pub client_id: String,
+    pub client_secret_hash: String, // bcrypt hash
+    pub name: String,
+    pub active: bool,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// JWT claims issued by the Control Plane /auth/token endpoint
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct JwtClaims {
+    pub sub: String,         // client_id
+    pub client_name: String,
+    pub iat: i64,
+    pub exp: i64,
+    pub jti: String,         // unique token id
+}
+
+/// Request body for token issuance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenRequest {
+    pub client_id: String,
+    pub client_secret: String,
+}
+
+/// Response body for token issuance
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TokenResponse {
+    pub access_token: String,
+    pub token_type: String,
+    pub expires_in: i64,
+    pub client_id: String,
+}
+
+/// Authenticated principal propagated through middleware
+#[derive(Debug, Clone)]
+pub struct AuthPrincipal {
+    pub client_id: String,
+    pub client_name: String,
+    pub auth_method: AuthMethod,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AuthMethod {
+    ClientCredentials,
+    JwtToken,
+}
+
+impl std::fmt::Display for AuthMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AuthMethod::ClientCredentials => write!(f, "client_credentials"),
+            AuthMethod::JwtToken => write!(f, "jwt"),
+        }
+    }
+}
+
 /// Connector definition for UI palette
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConnectorDefinition {
@@ -107,6 +169,108 @@ pub struct FlowDefinition {
     pub name: String,
     pub trigger: Trigger,
     pub steps: Vec<FlowStep>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub rate_limit: Option<RateLimitPolicy>,
+     #[serde(skip_serializing_if = "Option::is_none")]
+    pub circuit_breaker: Option<CircuitBreakerPolicy>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry: Option<RetryPolicy>,
+}
+
+/// Retry policy for flows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RetryPolicy {
+    /// Maximum number of retry attempts
+    pub max_attempts: u32,
+    /// Initial delay in milliseconds
+    pub initial_delay_ms: u64,
+    /// Maximum delay in milliseconds
+    pub max_delay_ms: u64,
+    /// Backoff multiplier (e.g., 2.0 for exponential)
+    #[serde(default = "default_backoff_multiplier")]
+    pub backoff_multiplier: f64,
+    /// Whether to use jitter
+    #[serde(default = "default_jitter")]
+    pub jitter: bool,
+}
+
+fn default_backoff_multiplier() -> f64 {
+    2.0
+}
+
+fn default_jitter() -> bool {
+    false
+}
+
+
+/// Rate limit policy for flows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitPolicy {
+    /// Maximum requests allowed in the time window
+    pub max_requests: u32,
+    /// Time window in seconds
+    pub window_seconds: u64,
+    /// Rate limit key type
+    #[serde(default = "default_key_type")]
+    pub key_type: RateLimitKeyType,
+    /// Custom message when rate limited
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+}
+
+fn default_key_type() -> RateLimitKeyType {
+    RateLimitKeyType::Global
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum RateLimitKeyType {
+    /// Global limit across all requests
+    Global,
+    /// Per IP address
+    PerIp,
+    /// Per user/API key (from headers)
+    PerUser,
+    /// Per flow
+    PerFlow,
+}
+
+/// Rate limit event sent from Data Plane to Control Plane
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RateLimitEvent {
+    pub flow_id: String,
+    pub key: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+    pub allowed: bool,
+    pub current_count: u32,
+    pub limit: u32,
+}
+
+/// Circuit breaker policy for flows
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerPolicy {
+    /// Number of consecutive failures before opening circuit
+    pub failure_threshold: u32,
+    /// Time window in seconds to track failures
+    pub window_seconds: u64,
+    /// Time in seconds before attempting to close circuit
+    pub timeout_seconds: u64,
+    /// Success threshold to close circuit from half-open
+    #[serde(default = "default_success_threshold")]
+    pub success_threshold: u32,
+}
+
+fn default_success_threshold() -> u32 {
+    3
+}
+
+/// Circuit breaker state
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitState {
+    Closed,
+    Open,
+    HalfOpen,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

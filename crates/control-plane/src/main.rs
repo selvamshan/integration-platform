@@ -9,23 +9,39 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::sync::Arc;
+use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use async_nats::Client as NatsClient;
 use futures::StreamExt;
+use jsonwebtoken::{encode, Header, EncodingKey};
 
+use common::{
+    ApiDefinition, 
+    FlowDefinition, 
+    Endpoint, 
+    ConfigUpdate, 
+    ConnectorDefinition, 
+    TriggerDefinition, 
+    Trigger,
+    RateLimitEvent,
+    JwtClaims,
+};
 
-use common::{ApiDefinition, FlowDefinition, Endpoint, ConfigUpdate, ConnectorDefinition, TriggerDefinition, Trigger};
+type RedisConnection = redis::aio::ConnectionManager;
 
 struct AppState {
     db: PgPool,
     nats: NatsClient,
-    apis: Arc<RwLock<Vec<ApiDefinition>>>,
-    flows: Arc<RwLock<Vec<FlowDefinition>>>,
-    connectors: Arc<RwLock<Vec<ConnectorDefinition>>>,
-    triggers: Arc<RwLock<Vec<TriggerDefinition>>>,
+    redis: RedisConnection,
+    apis:             Arc<RwLock<Vec<ApiDefinition>>>,
+    flows:            Arc<RwLock<Vec<FlowDefinition>>>,
+    connectors:       Arc<RwLock<Vec<ConnectorDefinition>>>,
+    triggers:         Arc<RwLock<Vec<TriggerDefinition>>>,
+    rate_limit_stats: Arc<RwLock<HashMap<String, Vec<RateLimitEvent>>>>,
+    jwt_secret:       String,
 }
 
 #[tokio::main]
@@ -44,37 +60,61 @@ async fn main() -> Result<()> {
     let db = PgPoolOptions::new().max_connections(10).connect(&database_url).await?;
     tracing::info!("✅ Database connected");
 
+    // Connect to Redis
+    let redis_url = std::env::var("REDIS_URL")
+        .unwrap_or_else(|_| "redis://redis:6379".to_string());
+    
+    tracing::info!("Connecting to Redis at {}...", redis_url);
+    let redis_client = redis::Client::open(redis_url)?;
+    let redis = redis::aio::ConnectionManager::new(redis_client).await?;
+    tracing::info!("✅ Redis connected");
+
     let nats_url = std::env::var("NATS_URL").unwrap_or_else(|_| "nats://nats:4222".to_string());
     let nats = async_nats::connect(&nats_url).await?;
     tracing::info!("✅ NATS connected");
+
+    let jwt_secret = std::env::var("JWT_SECRET")
+        .unwrap_or_else(|_| "integration-platform-secret-change-in-production".to_string());
+
 
     run_migrations(&db).await?;
     
     let state = Arc::new(AppState {
         db: db.clone(),
         nats,
+        redis,
         apis: Arc::new(RwLock::new(Vec::new())),
         flows: Arc::new(RwLock::new(Vec::new())),
         connectors: Arc::new(RwLock::new(Vec::new())),
         triggers: Arc::new(RwLock::new(Vec::new())),
+        rate_limit_stats: Arc::new(RwLock::new(HashMap::new())),
+        jwt_secret,
     });
 
     load_flows_from_database(state.clone()).await?;
+    initialize_builtin_registry(state.clone()).await?;
 
-
-    // Initialize built-in connectors and triggers
-    let init_state = state.clone();
-    tokio::spawn(async move {
-        if let Err(e) = initialize_builtin_registry(init_state).await {
-            tracing::error!("Failed to initialize registry: {}", e);
-        }
-    });
-
-      // Start flow sync service - listens for Data Plane registration
+   // Start flow sync service - listens for Data Plane registration
     let sync_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = flow_sync_service(sync_state).await {
             tracing::error!("Flow sync service error: {}", e);
+        }
+    });
+
+    // Start rate limit event listener
+    let ratelimit_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = rate_limit_event_listener(ratelimit_state).await {
+            tracing::error!("Rate limit event listener error: {}", e);
+        }
+    });
+
+    // Background: validate client credentials for data-planes (NATS request-reply)
+    let cred_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = credential_validation_service(cred_state).await {
+            tracing::error!("Credential validation error: {}", e);
         }
     });
 
@@ -93,6 +133,13 @@ async fn main() -> Result<()> {
         // Trigger registry routes (for UI palette)
         .route("/triggers", get(list_triggers))
         .route("/triggers/:id", get(get_trigger))
+        // ── Rate-limit stats ──────────────────────────────────────────────
+        .route("/rate-limits", get(get_rate_limit_stats))
+        .route("/rate-limits/:flow_id", get(get_flow_rate_limit_stats))
+        // ── Auth: client management & token issuance ──────────────────────
+        .route("/auth/clients",           post(create_client).get(list_clients))
+        .route("/auth/clients/:client_id",get(get_client).delete(delete_client).patch(toggle_client))
+        .route("/auth/token",             post(issue_token))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -171,7 +218,15 @@ async fn run_migrations(db: &PgPool) -> Result<()> {
     sqlx::query("CREATE TABLE IF NOT EXISTS flow_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS connector_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL UNIQUE, connector_type VARCHAR(100) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
     sqlx::query("CREATE TABLE IF NOT EXISTS trigger_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL UNIQUE, trigger_type VARCHAR(100) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
-    
+     // ── Auth table ────────────────────────────────────────────────────────────
+    sqlx::query("CREATE TABLE IF NOT EXISTS client_credentials (
+        client_id          VARCHAR(64)  PRIMARY KEY,
+        client_secret_hash TEXT         NOT NULL,
+        name               VARCHAR(255) NOT NULL,
+        active             BOOLEAN      NOT NULL DEFAULT TRUE,
+        created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        expires_at         TIMESTAMPTZ
+    )").execute(db).await?;
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
     if count.0 == 0 {
         sqlx::query("INSERT INTO users (name, email) VALUES ('Alice Johnson', 'alice@example.com'), ('Bob Smith', 'bob@example.com'), ('Charlie Brown', 'charlie@example.com'), ('Diana Prince', 'diana@example.com'), ('Eve Wilson', 'eve@example.com')").execute(db).await?;
@@ -548,7 +603,7 @@ async fn delete_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>)
 async fn auto_update_api_definition(state: &AppState, flow: &FlowDefinition, path: &str, method: &str) -> Result<(), AppError> {
     tracing::info!("🔄 Auto-updating API definition for flow: {}", flow.id);
     
-    let api_name = "Auto-Generated API";
+    let api_name = flow.name.clone();
     let api_version = "1.0";
     
     let mut apis = state.apis.write().await;
@@ -588,6 +643,8 @@ async fn auto_update_api_definition(state: &AppState, flow: &FlowDefinition, pat
                 flow_id: flow.id.clone(),
             }],
         };
+
+        tracing::info!("api_definitions id {}", uuid::Uuid::parse_str(&new_api.id).unwrap());
         
         sqlx::query("INSERT INTO api_definitions (id, name, version, base_path, config) VALUES ($1, $2, $3, $4, $5)")
             .bind(uuid::Uuid::parse_str(&new_api.id).unwrap())
@@ -631,9 +688,129 @@ async fn publish_event(nats: &NatsClient, event: &ConfigUpdate) -> Result<(), Ap
     Ok(())
 }
 
+// Rate limit event listener
+async fn rate_limit_event_listener(state: Arc<AppState>) -> Result<()> {
+    tracing::info!("📊 Starting Rate Limit Event Listener...");
+    
+    let mut subscriber = state.nats.subscribe("ratelimit.event").await?;
+    
+    tracing::info!("✅ Subscribed to ratelimit.event");
+    
+    while let Some(message) = subscriber.next().await {
+        match serde_json::from_slice::<RateLimitEvent>(&message.payload) {
+            Ok(event) => {
+                if !event.allowed {
+                    tracing::warn!(
+                        "🚫 Rate limit exceeded: flow={}, key={}, count={}/{}", 
+                        event.flow_id, event.key, event.current_count, event.limit
+                    );
+                } else {
+                    tracing::debug!(
+                        "✅ Rate limit check: flow={}, count={}/{}", 
+                        event.flow_id, event.current_count, event.limit
+                    );
+                }
+                
+                // Store event for statistics (keep last 1000 per flow)
+                let mut stats = state.rate_limit_stats.write().await;
+                let flow_events = stats.entry(event.flow_id.clone()).or_insert_with(Vec::new);
+                flow_events.push(event);
+                
+                // Keep only last 1000 events per flow
+                if flow_events.len() > 1000 {
+                    flow_events.drain(0..flow_events.len() - 1000);
+                }
+            }
+            Err(e) => {
+                tracing::error!("Failed to deserialize rate limit event: {}", e);
+            }
+        }
+    }
+    
+    Ok(())
+}
+
+// Get all rate limit statistics
+async fn get_rate_limit_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
+    let stats = state.rate_limit_stats.read().await;
+    
+    let mut summary = serde_json::Map::new();
+    
+    for (flow_id, events) in stats.iter() {
+        let total = events.len();
+        let blocked = events.iter().filter(|e| !e.allowed).count();
+        let allowed = events.iter().filter(|e| e.allowed).count();
+        
+        summary.insert(flow_id.clone(), json!({
+            "total_requests": total,
+            "allowed": allowed,
+            "blocked": blocked,
+            "block_rate": if total > 0 { (blocked as f64 / total as f64 * 100.0) } else { 0.0 }
+        }));
+    }
+    
+    Json(json!({
+        "flows": summary,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    }))
+}
+
+// Get rate limit statistics for specific flow
+async fn get_flow_rate_limit_stats(
+    State(state): State<Arc<AppState>>,
+    Path(flow_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let stats = state.rate_limit_stats.read().await;
+    
+    let events = stats.get(&flow_id)
+        .ok_or_else(|| AppError::NotFound(format!("No rate limit stats for flow: {}", flow_id)))?;
+    
+    let total = events.len();
+    let blocked = events.iter().filter(|e| !e.allowed).count();
+    let allowed = events.iter().filter(|e| e.allowed).count();
+    
+    // Get last 10 events
+    let recent_events: Vec<&RateLimitEvent> = events.iter()
+        .rev()
+        .take(10)
+        .collect();
+    
+    // Group by key to see which keys are hitting limits
+    let mut key_stats = std::collections::HashMap::new();
+    for event in events {
+        let entry = key_stats.entry(event.key.clone()).or_insert((0, 0));
+        if event.allowed {
+            entry.0 += 1;
+        } else {
+            entry.1 += 1;
+        }
+    }
+    
+    Ok(Json(json!({
+        "flow_id": flow_id,
+        "summary": {
+            "total_requests": total,
+            "allowed": allowed,
+            "blocked": blocked,
+            "block_rate": if total > 0 { (blocked as f64 / total as f64 * 100.0) } else { 0.0 }
+        },
+        "by_key": key_stats.iter().map(|(k, (a, b))| {
+            json!({
+                "key": k,
+                "allowed": a,
+                "blocked": b
+            })
+        }).collect::<Vec<_>>(),
+        "recent_events": recent_events,
+        "timestamp": chrono::Utc::now().to_rfc3339()
+    })))
+}
+
+// ─── Error type ──────────────────────────────────────────────────────────────
 enum AppError {
     NotFound(String),
     Internal(String),
+    Unauthorized(String),
 }
 
 impl IntoResponse for AppError {
@@ -641,6 +818,7 @@ impl IntoResponse for AppError {
         let (status, message) = match self {
             AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
+            AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
         };
         (status, Json(json!({"error": message}))).into_response()
     }
@@ -652,6 +830,246 @@ impl std::fmt::Display for AppError {
         match self {
             AppError::Internal(msg) => write!(f, "{msg}"),
             AppError::NotFound(msg) =>  write!(f, "{msg}"),
+            AppError::Unauthorized(msg) => write!(f, "{msg}"),
         }
     }
+}
+
+// ─── Credential validation service (NATS request-reply) ──────────────────────
+
+async fn credential_validation_service(state: Arc<AppState>) -> Result<()> {
+    let mut subscriber = state.nats.subscribe("auth.validate.credentials").await?;
+    tracing::info!("🔐 Credential validation service started");
+
+    while let Some(msg) = subscriber.next().await {
+        let reply = match msg.reply { Some(r) => r, None => continue };
+
+        let response = match do_validate_credentials(&state, &msg.payload).await {
+            Ok(p) => {
+                tracing::debug!("✅ Credential OK: {}", p.client_id);
+                json!({ "valid": true, "client_id": p.client_id, "name": p.client_name })
+            }
+            Err(reason) => {
+                tracing::warn!("❌ Credential rejected: {}", reason);
+                json!({ "valid": false, "reason": reason })
+            }
+        };
+
+        let _ = state.nats.publish(reply, serde_json::to_vec(&response).unwrap_or_default().into()).await;
+    }
+    Ok(())
+}
+
+async fn do_validate_credentials(
+    state: &AppState,
+    payload: &[u8],
+) -> std::result::Result<common::AuthPrincipal, String> {
+    #[derive(Deserialize)]
+    struct Req { client_id: String, client_secret: String }
+
+    let req: Req = serde_json::from_slice(payload).map_err(|_| "Malformed request".to_string())?;
+
+    let row = sqlx::query!(
+        "SELECT client_id, client_secret_hash, name, active, expires_at
+         FROM client_credentials WHERE client_id = $1", req.client_id
+    )
+    .fetch_optional(&state.db).await.map_err(|e| e.to_string())?
+    .ok_or_else(|| "Client not found".to_string())?;
+
+    if !row.active { return Err("Client is deactivated".into()); }
+    if let Some(exp) = row.expires_at {
+        if exp < chrono::Utc::now() { return Err("Credential expired".into()); }
+    }
+    if !bcrypt::verify(&req.client_secret, &row.client_secret_hash).map_err(|e| e.to_string())? {
+        return Err("Invalid secret".into());
+    }
+
+    Ok(common::AuthPrincipal {
+        client_id:   row.client_id,
+        client_name: row.name,
+        auth_method: common::AuthMethod::ClientCredentials,
+    })
+}
+
+// ─── Auth: client CRUD ────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+struct CreateClientBody {
+    name: String,
+    expires_in_days: Option<i64>,
+}
+
+/// POST /auth/clients — create credentials; plain secret returned once
+async fn create_client(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateClientBody>,
+) -> Result<Json<Value>, AppError> {
+    let client_id  = format!("cid_{}", uuid::Uuid::new_v4().simple());
+    let raw_secret = format!("cs_{}", uuid::Uuid::new_v4().simple());
+    let hash = bcrypt::hash(&raw_secret, bcrypt::DEFAULT_COST)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let expires_at: Option<chrono::DateTime<chrono::Utc>> =
+        body.expires_in_days.map(|d| chrono::Utc::now() + chrono::Duration::days(d));
+
+    sqlx::query!(
+        "INSERT INTO client_credentials (client_id, client_secret_hash, name, active, expires_at)
+         VALUES ($1, $2, $3, TRUE, $4)",
+        client_id, hash, body.name, expires_at
+    )
+    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tracing::info!("🔑 Created client: {} ({})", body.name, client_id);
+
+    Ok(Json(json!({
+        "client_id":     client_id,
+        "client_secret": raw_secret,   // shown ONCE — store securely
+        "name":          body.name,
+        "active":        true,
+        "expires_at":    expires_at,
+        "warning":       "Store client_secret now — it will not be shown again"
+    })))
+}
+
+/// GET /auth/clients
+async fn list_clients(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let rows = sqlx::query!(
+        "SELECT client_id, name, active, created_at, expires_at
+         FROM client_credentials ORDER BY created_at DESC"
+    )
+    .fetch_all(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let clients: Vec<Value> = rows.iter().map(|r| json!({
+        "client_id":  r.client_id,
+        "name":       r.name,
+        "active":     r.active,
+        "created_at": r.created_at,
+        "expires_at": r.expires_at,
+    })).collect();
+
+    Ok(Json(json!({ "clients": clients, "count": clients.len() })))
+}
+
+/// GET /auth/clients/:client_id
+async fn get_client(
+    State(state): State<Arc<AppState>>,
+    Path(client_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let row = sqlx::query!(
+        "SELECT client_id, name, active, created_at, expires_at
+         FROM client_credentials WHERE client_id = $1", client_id
+    )
+    .fetch_optional(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::NotFound(format!("Client not found: {}", client_id)))?;
+
+    Ok(Json(json!({
+        "client_id":  row.client_id,
+        "name":       row.name,
+        "active":     row.active,
+        "created_at": row.created_at,
+        "expires_at": row.expires_at,
+    })))
+}
+
+/// DELETE /auth/clients/:client_id
+async fn delete_client(
+    State(state): State<Arc<AppState>>,
+    Path(client_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let res = sqlx::query!(
+        "DELETE FROM client_credentials WHERE client_id = $1", client_id
+    )
+    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("Client not found: {}", client_id)));
+    }
+    tracing::info!("🗑️  Deleted client: {}", client_id);
+    Ok(Json(json!({ "deleted": client_id })))
+}
+
+/// PATCH /auth/clients/:client_id — activate or deactivate
+#[derive(Deserialize)]
+struct ToggleBody { active: bool }
+
+async fn toggle_client(
+    State(state): State<Arc<AppState>>,
+    Path(client_id): Path<String>,
+    Json(body): Json<ToggleBody>,
+) -> Result<Json<Value>, AppError> {
+    let res = sqlx::query!(
+        "UPDATE client_credentials SET active = $1 WHERE client_id = $2",
+        body.active, client_id
+    )
+    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    if res.rows_affected() == 0 {
+        return Err(AppError::NotFound(format!("Client not found: {}", client_id)));
+    }
+    let status = if body.active { "activated" } else { "deactivated" };
+    tracing::info!("🔄 Client {} {}", client_id, status);
+    Ok(Json(json!({ "client_id": client_id, "active": body.active })))
+}
+
+// ─── Auth: token issuance ─────────────────────────────────────────────────────
+
+const TOKEN_EXPIRY_SECS: i64 = 3600; // 1 hour
+
+/// POST /auth/token — exchange client_id + secret for a signed JWT
+async fn issue_token(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<common::TokenRequest>,
+) -> Result<Json<Value>, AppError> {
+    // 1. Fetch record
+    let row = sqlx::query!(
+        "SELECT client_id, client_secret_hash, name, active, expires_at
+         FROM client_credentials WHERE client_id = $1", body.client_id
+    )
+    .fetch_optional(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?
+    .ok_or_else(|| AppError::Unauthorized("Invalid credentials".into()))?;
+
+    // 2. Active check
+    if !row.active {
+        return Err(AppError::Unauthorized("Client is deactivated".into()));
+    }
+
+    // 3. Expiry check
+    if let Some(exp) = row.expires_at {
+        if exp < chrono::Utc::now() {
+            return Err(AppError::Unauthorized("Credential has expired".into()));
+        }
+    }
+
+    // 4. Secret verification
+    let ok = bcrypt::verify(&body.client_secret, &row.client_secret_hash)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    if !ok {
+        return Err(AppError::Unauthorized("Invalid credentials".into()));
+    }
+
+    // 5. Sign JWT
+    let now = chrono::Utc::now().timestamp();
+    let claims = JwtClaims {
+        sub:         row.client_id.clone(),
+        client_name: row.name.clone(),
+        iat:         now,
+        exp:         now + TOKEN_EXPIRY_SECS,
+        jti:         uuid::Uuid::new_v4().to_string(),
+    };
+    let token = encode(
+        &Header::default(),
+        &claims,
+        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
+    ).map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tracing::info!("🎫 Token issued for: {} ({})", row.name, row.client_id);
+
+    Ok(Json(json!({
+        "access_token": token,
+        "token_type":   "Bearer",
+        "expires_in":   TOKEN_EXPIRY_SECS,
+        "client_id":    row.client_id,
+    })))
 }

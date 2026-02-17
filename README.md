@@ -583,3 +583,307 @@ docker-compose logs -f data-plane | grep '📥'     # Receiving
 
 See **EVENT-DRIVEN-ARCHITECTURE.md** for complete documentation.
 
+
+## 🎨 **Flow Designer UI Support**
+
+### Connector & Trigger Palette
+
+The Control Plane maintains a **registry of connectors and triggers** in the database for frontend flow designer UIs.
+
+**Load Palette Data:**
+```bash
+# Get available connectors
+curl http://localhost:8081/connectors
+
+# Get available triggers  
+curl http://localhost:8081/triggers
+```
+
+**Built-in Components:**
+- 🌐 **HTTP Connector** - GET, POST operations
+- 🐘 **PostgreSQL Connector** - query, execute operations
+- 🌐 **HTTP Trigger** - Trigger on HTTP request
+- ⏰ **Schedule Trigger** - Trigger on cron schedule
+
+### Automatic API Management
+
+**API definitions are automatically created/updated/deleted** when flows with HTTP triggers change.
+
+**Example:**
+```bash
+# 1. Create flow with HTTP trigger
+curl -X POST http://localhost:8081/flows -d '{
+  "id": "my-flow",
+  "trigger": {"type": "http", "path": "/api/users", "method": "GET"},
+  ...
+}'
+
+# 2. API endpoint automatically created: GET /api/users → my-flow
+
+# 3. Update flow path
+curl -X PUT http://localhost:8081/flows/my-flow -d '{
+  "trigger": {"type": "http", "path": "/api/v2/users", "method": "GET"}
+}'
+
+# 4. API endpoint automatically updated: GET /api/v2/users → my-flow
+
+# 5. Delete flow
+curl -X DELETE http://localhost:8081/flows/my-flow
+
+# 6. API endpoint automatically removed
+```
+
+**Benefits:**
+- ✅ No manual API management
+- ✅ APIs always in sync with flows
+- ✅ Frontend gets connector/trigger metadata
+- ✅ Parameter validation schemas included
+
+### Test UI Features
+
+```bash
+# Test connector/trigger registry and auto-API
+./test-ui-palette.sh
+```
+
+See **UI-PALETTE-GUIDE.md** for complete documentation and frontend integration guide.
+
+
+## 🛡️ **Rate Limiting with Redis**
+
+### Distributed Rate Limiting
+
+The platform includes **Redis-based rate limiting** enforced at the Data Plane level with monitoring in the Control Plane.
+
+**Features:**
+- ✅ **Per-flow rate limits** configured in flow definition
+- ✅ **Multiple key types:** global, per-IP, per-user, per-flow
+- ✅ **Redis persistence** for distributed consistency
+- ✅ **Real-time monitoring** via NATS events
+- ✅ **Statistics API** in Control Plane
+- ✅ **Custom error messages**
+
+### Rate Limit Policy
+
+```json
+{
+  "id": "my-api",
+  "name": "My API",
+  "trigger": {"type": "http", "path": "/api/data", "method": "GET"},
+  "steps": [...],
+  "rate_limit": {
+    "max_requests": 100,
+    "window_seconds": 60,
+    "key_type": "per_ip",
+    "message": "Too many requests. Please try again later."
+  }
+}
+```
+
+### Example: Create Rate Limited Flow
+
+```bash
+curl -X POST http://localhost:8081/flows \
+  -H "Content-Type: application/json" \
+  -d '{
+    "id": "public-api",
+    "name": "Public API",
+    "trigger": {"type": "http", "path": "/api/public", "method": "GET"},
+    "steps": [...],
+    "rate_limit": {
+      "max_requests": 10,
+      "window_seconds": 60,
+      "key_type": "per_ip",
+      "message": "Maximum 10 requests per minute"
+    }
+  }'
+```
+
+**When limit exceeded:**
+```json
+{
+  "error": "Maximum 10 requests per minute",
+  "flow_id": "public-api",
+  "limit": 10,
+  "window_seconds": 60
+}
+```
+**HTTP Status:** `429 Too Many Requests`
+
+### Monitor Rate Limits
+
+```bash
+# Get all rate limit statistics
+curl http://localhost:8081/rate-limits
+
+# Get specific flow statistics
+curl http://localhost:8081/rate-limits/my-flow
+
+# Test rate limiting
+./test-rate-limiting.sh
+```
+
+### Architecture
+
+```
+Client Request
+    ↓
+Data Plane → Rate Limit Middleware → Redis Check
+    ↓                                      ↓
+  Allow                                 Block (429)
+    ↓
+Execute Flow
+    ↓
+NATS Event → Control Plane → Statistics API
+```
+
+See **RATE-LIMITING.md** for complete documentation.
+
+
+## 📊 **Metrics & Observability**
+
+### Prometheus Metrics
+
+The Data Plane exposes **Prometheus metrics** for comprehensive monitoring at `/metrics` endpoint.
+
+**Metrics Categories:**
+- **HTTP Metrics** - Request count, duration histograms
+- **Flow Execution** - Success/failure rates, execution duration
+- **Rate Limiting** - Checks, blocks, allow rates
+- **System Health** - Flows loaded, Redis operations
+
+### Available Metrics
+
+```bash
+# Access metrics endpoint
+curl http://localhost:8080/metrics
+
+# Key metrics:
+# - http_requests_total
+# - http_request_duration_seconds (histogram)
+# - flow_executions_total
+# - flow_executions_success_total
+# - flow_executions_failed_total
+# - flow_execution_duration_seconds (histogram)
+# - rate_limit_checks_total
+# - rate_limit_blocked_total
+# - flows_loaded (gauge)
+# - redis_operations_total
+```
+
+### Sample PromQL Queries
+
+```promql
+# Request rate (QPS)
+rate(http_requests_total[5m])
+
+# Flow success rate
+rate(flow_executions_success_total[5m]) / rate(flow_executions_total[5m]) * 100
+
+# P95 latency
+histogram_quantile(0.95, rate(http_request_duration_seconds_bucket[5m]))
+
+# Rate limit block rate
+rate(rate_limit_blocked_total[5m]) / rate(rate_limit_checks_total[5m]) * 100
+```
+
+### Test Metrics
+
+```bash
+# Run metrics test suite
+./test-metrics.sh
+
+# This generates load and verifies:
+# ✅ Metrics endpoint working
+# ✅ HTTP metrics tracked
+# ✅ Flow metrics tracked
+# ✅ Histogram data available
+# ✅ Rate limit metrics tracked
+```
+
+### Grafana Dashboard Setup
+
+See **METRICS.md** for:
+- Complete metrics reference
+- Prometheus configuration
+- Grafana dashboard examples
+- Alerting rules
+- Best practices
+
+**Example Dashboard Panels:**
+- Request Rate (QPS)
+- Flow Success Rate (%)
+- P50/P95/P99 Latency
+- Active Flows Count
+- Rate Limit Block Rate
+
+
+## 🔌 **Circuit Breaker Pattern**
+
+### Automatic Failure Protection
+
+The Data Plane includes a **Circuit Breaker** to prevent cascading failures and provide graceful degradation.
+
+**States:**
+- **CLOSED** - Normal operation, all requests allowed
+- **OPEN** - Too many failures, all requests rejected (HTTP 503)
+- **HALF-OPEN** - Testing recovery, limited requests allowed
+
+### Configuration
+
+```json
+{
+  "id": "external-api",
+  "name": "External API Flow",
+  "trigger": {...},
+  "steps": [...],
+  "circuit_breaker": {
+    "failure_threshold": 5,
+    "window_seconds": 60,
+    "timeout_seconds": 30,
+    "success_threshold": 3
+  }
+}
+```
+
+**Behavior:**
+1. After 5 failures → Circuit OPENS
+2. All requests rejected for 30 seconds
+3. After timeout → Circuit HALF-OPEN
+4. If 3 consecutive successes → Circuit CLOSES
+5. If any failure in half-open → Circuit OPENS again
+
+### Circuit Breaker Metrics
+
+```prometheus
+# Current state (0=closed, 1=open, 2=half_open)
+circuit_breaker_state{flow_id="my-flow"}
+
+# State transitions
+circuit_breaker_opens_total
+circuit_breaker_closes_total
+circuit_breaker_half_opens_total
+
+# Rejected requests
+circuit_breaker_rejected_total
+```
+
+### Monitoring
+
+```bash
+# Check circuit breaker status
+curl http://localhost:8080/circuit-breakers
+
+# Test circuit breaker
+./test-circuit-breaker.sh
+```
+
+**Benefits:**
+- ✅ Prevent cascading failures
+- ✅ Fast-fail for unavailable services
+- ✅ Automatic recovery
+- ✅ Per-flow configuration
+- ✅ Complete metrics
+
+See **CIRCUIT-BREAKER.md** for complete documentation.
+
