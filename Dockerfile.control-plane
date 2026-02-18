@@ -6,6 +6,7 @@ WORKDIR /app
 
 # Copy entire workspace
 COPY Cargo.toml ./
+COPY .sqlx ./.sqlx
 COPY crates ./crates
 
 # Build the control-plane binary

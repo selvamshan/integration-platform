@@ -293,9 +293,9 @@ async fn main() -> Result<()> {
     let protected = Router::new()
         .route("/flows/:flow_id/execute", post(execute_flow))
         .route("/api/trigger/:path", get(trigger_flow))
-        .layer(middleware::from_fn_with_state(auth_cfg, auth_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), circuit_breaker_middleware))
-        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware));
+        .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
+        .layer(middleware::from_fn_with_state(auth_cfg, auth_middleware));
 
     // Public routes: no authentication required
     let public = Router::new()
@@ -314,6 +314,7 @@ async fn main() -> Result<()> {
     // Start server
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8080));
     tracing::info!("🌐 Data Plane listening on {}", addr);
+    tracing::info!("🔐 Auth: Client-Credentials + JWT Bearer supported");
     tracing::info!("📊 Metrics: http://{}:{}/metrics", addr.ip(), addr.port());
     tracing::info!("🔌 Circuit Breakers: http://{}:{}/circuit-breakers", addr.ip(), addr.port());
 
@@ -1094,7 +1095,7 @@ fn create_default_flow(path: &str) -> FlowDefinition {
                 connector: "postgres".to_string(),
                 operation: "query".to_string(),
                 params: json!({
-                    "sql": "SELECT * FROM users LIMIT 10"
+                    "sql": "SELECT * FROM users LIMIT 1"
                 }),
             },
             FlowStep::Log {
