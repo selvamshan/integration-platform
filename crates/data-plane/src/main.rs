@@ -48,8 +48,10 @@ use integration_runtime::connectors::{http::HttpConnector, postgres::PostgresCon
 
 mod retry;
 mod auth;
+mod connector_registry;
 //use retry::with_retry;
 use auth::{auth_middleware, AuthConfig};
+use connector_registry::{ConnectorRegistry, CryptoService};
 
 type RedisConnection = redis::aio::ConnectionManager;
 
@@ -192,6 +194,7 @@ struct AppState {
     executor: Arc<RwLock<FlowExecutor>>,
     flows: Arc<RwLock<std::collections::HashMap<String, FlowDefinition>>>,
     circuit_breakers: Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
+    connector_registry: Arc<ConnectorRegistry>,
     nats: NatsClient,
     redis: RedisConnection,
     node_id: String,
@@ -244,15 +247,21 @@ async fn main() -> Result<()> {
     http_connector.connect().await?;
     executor.register_connector("http".to_string(), Box::new(http_connector));
     
-    // Register PostgreSQL connector
-    let db_url = std::env::var("DATABASE_URL")
-        .unwrap_or_else(|_| "postgresql://platform:platform123@postgres:5432/integration_platform".to_string());
+    // // Register PostgreSQL connector
+    // let db_url = std::env::var("DATABASE_URL")
+    //     .unwrap_or_else(|_| "postgresql://platform:platform123@postgres:5432/integration_platform".to_string());
     
-    let mut postgres_connector = PostgresConnector::new(db_url);
-    postgres_connector.connect().await?;
-    executor.register_connector("postgres".to_string(), Box::new(postgres_connector));
+    // let mut postgres_connector = PostgresConnector::new(db_url);
+    // postgres_connector.connect().await?;
+    // executor.register_connector("postgres".to_string(), Box::new(postgres_connector));
     
-    tracing::info!("✅ Connectors initialized");
+   tracing::info!("✅ HTTP connector initialized (DB connectors registered on-demand)");
+
+   // Initialize crypto service for decrypting connector passwords
+    let crypto = Arc::new(CryptoService::new()?);
+    let connector_registry = Arc::new(ConnectorRegistry::new(crypto));
+    tracing::info!("✅ Connector registry initialized");
+
 
     let jwt_secret = std::env::var("JWT_SECRET")
         .unwrap_or_else(|_| "integration-platform-secret-change-in-production".to_string());
@@ -262,6 +271,7 @@ async fn main() -> Result<()> {
         executor: Arc::new(RwLock::new(executor)),
         flows: Arc::new(RwLock::new(std::collections::HashMap::new())),
         circuit_breakers: Arc::new(RwLock::new(HashMap::new())),
+        connector_registry: connector_registry.clone(),
         nats: nats.clone(),
         redis,
         node_id: node_id.clone(),
@@ -276,12 +286,19 @@ async fn main() -> Result<()> {
         }
     });
 
+    // Listen for connector instance updates from Control Plane
+    let connector_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = listen_for_connector_instances(connector_state).await {
+            tracing::error!("Connector instance listener error: {}", e);
+        }
+    });
+
         // Wait a moment for subscription to be ready
     tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
 
     // Register with Control Plane to receive all flows
     register_with_control_plane(state.clone()).await?;
-
 
     // Auth config – shared by the auth middleware
     let auth_cfg = Arc::new(AuthConfig {
@@ -927,6 +944,10 @@ async fn execute_flow(
     
     let flow = flow.ok_or_else(|| AppError::NotFound(format!("Flow not found: {}", flow_id)))?;
     
+     // Connect flow connectors dynamically before execution
+    connect_flow_connectors(&state, &flow).await
+        .map_err(|e| AppError::Internal(format!("Connector setup failed: {}", e)))?;
+
     let cb_policy = flow.circuit_breaker.clone();
     let retry_policy = flow.retry.clone();
 
@@ -1018,6 +1039,11 @@ async fn trigger_flow(
     };
     
     let flow_id = flow.id.clone();
+
+    // Connect flow connectors dynamically before execution
+    connect_flow_connectors(&state, &flow).await
+        .map_err(|e| AppError::Internal(format!("Connector setup failed: {}", e)))?;
+
     let cb_policy = flow.circuit_breaker.clone(); 
     let retry_policy = flow.retry.clone();       
     
@@ -1132,4 +1158,87 @@ impl IntoResponse for AppError {
 
         (status, body).into_response()
     }
+}
+
+
+// ─── Connector Instance Listener ─────────────────────────────────────────────
+
+async fn listen_for_connector_instances(state: Arc<AppState>) -> Result<()> {
+    tracing::info!("🔌 Listening for connector instance events...");
+    
+    let mut created = state.nats.subscribe("connector.instance.created").await?;
+    let mut updated = state.nats.subscribe("connector.instance.updated").await?;
+    let mut deleted = state.nats.subscribe("connector.instance.deleted").await?;
+    
+    loop {
+        tokio::select! {
+            Some(msg) = created.next() => {
+                if let Ok(event) = serde_json::from_slice::<common::ConnectorInstanceEvent>(&msg.payload) {
+                    if let common::ConnectorInstanceEvent::Created { instance } = event {
+                        tracing::info!("📥 Connector instance created: {}", instance.id);
+                        state.connector_registry.register(instance).await;
+                    }
+                }
+            }
+            Some(msg) = updated.next() => {
+                if let Ok(event) = serde_json::from_slice::<common::ConnectorInstanceEvent>(&msg.payload) {
+                    if let common::ConnectorInstanceEvent::Updated { instance } = event {
+                        tracing::info!("📥 Connector instance updated: {}", instance.id);
+                        state.connector_registry.register(instance).await;
+                    }
+                }
+            }
+            Some(msg) = deleted.next() => {
+                if let Ok(event) = serde_json::from_slice::<common::ConnectorInstanceEvent>(&msg.payload) {
+                    if let common::ConnectorInstanceEvent::Deleted { id } = event {
+                        tracing::info!("📥 Connector instance deleted: {}", id);
+                        state.connector_registry.unregister(&id).await;
+                    }
+                }
+            }
+        }
+    }
+}
+
+// ─── Dynamic Connector Connection Helper ─────────────────────────────────────
+
+/// Extract unique connector IDs from flow steps and connect them
+async fn connect_flow_connectors(
+    state: &AppState,
+    flow: &FlowDefinition,
+) -> Result<()> {
+    use common::FlowStep;
+    
+    let mut connector_ids = std::collections::HashSet::new();
+    
+    for step in &flow.steps {
+        if let FlowStep::Call { connector, .. } = step {
+            connector_ids.insert(connector.clone());
+        }
+    }
+    
+    if connector_ids.is_empty() {
+        return Ok(());
+    }
+    
+    // Get a mutable executor to register connectors
+    let mut executor = state.executor.write().await;
+    
+    for connector_id in connector_ids {
+        // Skip 'http' - already registered at startup
+        if connector_id == "http" {
+            continue;
+        }
+        
+        // Dynamically connect this connector
+        state.connector_registry
+            .connect_for_flow(&connector_id, &mut *executor)
+            .await
+            .map_err(|e| {
+                tracing::error!("Failed to connect {}: {}", connector_id, e);
+                e
+            })?;
+    }
+    
+    Ok(())
 }

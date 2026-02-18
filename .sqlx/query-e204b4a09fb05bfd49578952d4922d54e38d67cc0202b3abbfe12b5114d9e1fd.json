@@ -1,0 +1,80 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, name, connector_type, host, port, database_name, username,\n                password_encrypted, extra_attributes, active, created_at\n         FROM connector_instances WHERE active = TRUE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 2,
+        "name": "connector_type",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 3,
+        "name": "host",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 4,
+        "name": "port",
+        "type_info": "Int4"
+      },
+      {
+        "ordinal": 5,
+        "name": "database_name",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 6,
+        "name": "username",
+        "type_info": "Varchar"
+      },
+      {
+        "ordinal": 7,
+        "name": "password_encrypted",
+        "type_info": "Text"
+      },
+      {
+        "ordinal": 8,
+        "name": "extra_attributes",
+        "type_info": "Jsonb"
+      },
+      {
+        "ordinal": 9,
+        "name": "active",
+        "type_info": "Bool"
+      },
+      {
+        "ordinal": 10,
+        "name": "created_at",
+        "type_info": "Timestamptz"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "e204b4a09fb05bfd49578952d4922d54e38d67cc0202b3abbfe12b5114d9e1fd"
+}

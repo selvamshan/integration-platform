@@ -344,3 +344,41 @@ impl ConfigUpdate {
         }
     }
 }
+
+// ─── Dynamic Connector Instances ─────────────────────────────────────────────
+
+/// A registered connector instance with credentials (e.g., postgres_prod, postgres_dev).
+/// Stored in DB with encrypted password.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectorInstance {
+    pub id:              String,           // e.g., "postgres_prod"
+    pub name:            String,           // Human-readable: "Production DB"
+    pub connector_type:  String,           // "postgres", "http", etc.
+    pub host:            String,
+    pub port:            u16,
+    pub database:        Option<String>,   // for DB connectors
+    pub username:        String,
+    pub password_encrypted: String,        // AES-256 encrypted
+    pub extra_attributes: serde_json::Value, // JSON for any connector-specific config
+    pub active:          bool,
+    pub created_at:      chrono::DateTime<chrono::Utc>,
+}
+
+/// Config update event for connector instances
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ConnectorInstanceEvent {
+    Created { instance: ConnectorInstance },
+    Updated { instance: ConnectorInstance },
+    Deleted { id: String },
+}
+
+impl ConnectorInstanceEvent {
+    pub fn subject(&self) -> &'static str {
+        match self {
+            Self::Created { .. } => "connector.instance.created",
+            Self::Updated { .. } => "connector.instance.updated",
+            Self::Deleted { .. } => "connector.instance.deleted",
+        }
+    }
+}

@@ -1,0 +1,22 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO connector_instances\n         (id, name, connector_type, host, port, database_name, username, password_encrypted, extra_attributes, active)\n         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8ad13a03328c13ca44cf85f899b0f9dddcd7b0c60ae058cbdea19d03caddac97"
+}

@@ -22,7 +22,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono"] }
 tower = "0.4"
 tower-http = { version = "0.5", features = ["trace", "cors"] }
-reqwest = { version = "0.11", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }
 async-nats = "0.33"
@@ -33,3 +33,6 @@ lazy_static = "1.4"
 rand = "0.8"
 jsonwebtoken = "9"
 bcrypt = "0.15"
+aes-gcm = "0.10"
+hex = "0.4"
+base64 = "0.21"

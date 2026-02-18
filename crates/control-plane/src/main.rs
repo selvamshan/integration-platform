@@ -30,6 +30,9 @@ use common::{
     JwtClaims,
 };
 
+use crypto::CryptoService;
+mod crypto;
+
 type RedisConnection = redis::aio::ConnectionManager;
 
 struct AppState {
@@ -40,8 +43,10 @@ struct AppState {
     flows:            Arc<RwLock<Vec<FlowDefinition>>>,
     connectors:       Arc<RwLock<Vec<ConnectorDefinition>>>,
     triggers:         Arc<RwLock<Vec<TriggerDefinition>>>,
+    connector_instances: Arc<RwLock<Vec<common::ConnectorInstance>>>,
     rate_limit_stats: Arc<RwLock<HashMap<String, Vec<RateLimitEvent>>>>,
     jwt_secret:       String,
+    crypto:           Arc<CryptoService>,
 }
 
 #[tokio::main]
@@ -75,7 +80,9 @@ async fn main() -> Result<()> {
 
     let jwt_secret = std::env::var("JWT_SECRET")
         .unwrap_or_else(|_| "integration-platform-secret-change-in-production".to_string());
-
+    
+    let crypto = Arc::new(CryptoService::new()?);
+    tracing::info!("✅ Encryption service initialized");
 
     run_migrations(&db).await?;
     
@@ -87,11 +94,14 @@ async fn main() -> Result<()> {
         flows: Arc::new(RwLock::new(Vec::new())),
         connectors: Arc::new(RwLock::new(Vec::new())),
         triggers: Arc::new(RwLock::new(Vec::new())),
+        connector_instances: Arc::new(RwLock::new(Vec::new())),
         rate_limit_stats: Arc::new(RwLock::new(HashMap::new())),
         jwt_secret,
+        crypto,
     });
 
     load_flows_from_database(state.clone()).await?;
+    load_connector_instances(&state).await?;
     initialize_builtin_registry(state.clone()).await?;
 
    // Start flow sync service - listens for Data Plane registration
@@ -101,6 +111,15 @@ async fn main() -> Result<()> {
             tracing::error!("Flow sync service error: {}", e);
         }
     });
+
+     // Background: push connector instances to newly registered data-planes
+    let connector_sync_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(e) = connector_instance_sync_service(connector_sync_state).await {
+            tracing::error!("Connector instance sync error: {}", e);
+        }
+    });
+
 
     // Start rate limit event listener
     let ratelimit_state = state.clone();
@@ -140,6 +159,9 @@ async fn main() -> Result<()> {
         .route("/auth/clients",           post(create_client).get(list_clients))
         .route("/auth/clients/:client_id",get(get_client).delete(delete_client).patch(toggle_client))
         .route("/auth/token",             post(issue_token))
+         // ── Connector Instances ────────────────────────────────────────────
+        .route("/connector-instances",     post(create_connector_instance).get(list_connector_instances))
+        .route("/connector-instances/:id", get(get_connector_instance).delete(delete_connector_instance))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -226,6 +248,21 @@ async fn run_migrations(db: &PgPool) -> Result<()> {
         active             BOOLEAN      NOT NULL DEFAULT TRUE,
         created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
         expires_at         TIMESTAMPTZ
+    )").execute(db).await?;
+
+    // ── Connector instances table ─────────────────────────────────────────────
+    sqlx::query("CREATE TABLE IF NOT EXISTS connector_instances (
+        id                  VARCHAR(64)  PRIMARY KEY,
+        name                VARCHAR(255) NOT NULL,
+        connector_type      VARCHAR(100) NOT NULL,
+        host                VARCHAR(255) NOT NULL,
+        port                INTEGER      NOT NULL,
+        database_name       VARCHAR(255),
+        username            VARCHAR(255) NOT NULL,
+        password_encrypted  TEXT         NOT NULL,
+        extra_attributes    JSONB        NOT NULL DEFAULT '{}',
+        active              BOOLEAN      NOT NULL DEFAULT TRUE,
+        created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     )").execute(db).await?;
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
     if count.0 == 0 {
@@ -688,6 +725,42 @@ async fn publish_event(nats: &NatsClient, event: &ConfigUpdate) -> Result<(), Ap
     Ok(())
 }
 
+// ─── Connector Instance Sync Service ─────────────────────────────────────────
+
+/// Push all connector instances to newly-registered data-planes
+async fn connector_instance_sync_service(state: Arc<AppState>) -> Result<()> {
+    let mut subscriber = state.nats.subscribe("dataplane.register").await?;
+    tracing::info!("🔄 Connector instance sync: listening for data-plane registrations");
+
+    while let Some(msg) = subscriber.next().await {
+        let node_id = String::from_utf8_lossy(&msg.payload).to_string();
+        tracing::info!("📡 Data-plane registered: {}, syncing connector instances...", node_id);
+
+        let instances = state.connector_instances.read().await.clone();
+        for instance in &instances {
+            let event = common::ConnectorInstanceEvent::Created {
+                instance: instance.clone(),
+            };
+            
+            let payload = match serde_json::to_vec(&event) {
+                Ok(p) => p,
+                Err(e) => {
+                    tracing::error!("Failed to serialize connector instance {}: {}", instance.id, e);
+                    continue;
+                }
+            };
+
+            if let Err(e) = state.nats.publish(event.subject(), payload.into()).await {
+                tracing::error!("Failed to push connector instance {}: {}", instance.id, e);
+            }
+        }
+        
+        tracing::info!("✅ Pushed {} connector instances to {}", instances.len(), node_id);
+    }
+
+    Ok(())
+}
+
 // Rate limit event listener
 async fn rate_limit_event_listener(state: Arc<AppState>) -> Result<()> {
     tracing::info!("📊 Starting Rate Limit Event Listener...");
@@ -1073,3 +1146,176 @@ async fn issue_token(
         "client_id":    row.client_id,
     })))
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Connector Instances — Dynamic registration with encrypted credentials
+// ─────────────────────────────────────────────────────────────────────────────
+
+#[derive(serde::Deserialize)]
+struct CreateConnectorInstanceBody {
+    id:               Option<String>,
+    name:             String,
+    connector_type:   String,
+    host:             String,
+    port:             u16,
+    database:         Option<String>,
+    username:         String,
+    password:         String,  // plain — will be encrypted
+    extra_attributes: Option<serde_json::Value>,
+}
+
+/// POST /connector-instances — register a new connector instance
+async fn create_connector_instance(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<CreateConnectorInstanceBody>,
+) -> Result<Json<Value>, AppError> {
+    let id = body.id.unwrap_or_else(|| format!("conn_{}", uuid::Uuid::new_v4().simple()));
+
+    let password_encrypted = state.crypto.encrypt(&body.password)
+        .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
+
+    let extra = body.extra_attributes.unwrap_or(json!({}));
+
+    sqlx::query!(
+        "INSERT INTO connector_instances
+         (id, name, connector_type, host, port, database_name, username, password_encrypted, extra_attributes, active)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)",
+        id, body.name, body.connector_type, body.host, body.port as i32,
+        body.database, body.username, password_encrypted, extra
+    )
+    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    let instance = common::ConnectorInstance {
+        id:                  id.clone(),
+        name:                body.name.clone(),
+        connector_type:      body.connector_type.clone(),
+        host:                body.host.clone(),
+        port:                body.port,
+        database:            body.database.clone(),
+        username:            body.username.clone(),
+        password_encrypted:  password_encrypted.clone(),
+        extra_attributes:    extra.clone(),
+        active:              true,
+        created_at:          chrono::Utc::now(),
+    };
+
+    state.connector_instances.write().await.push(instance.clone());
+
+    let event = common::ConnectorInstanceEvent::Created { instance: instance.clone() };
+    publish_connector_instance_event(&state.nats, &event).await?;
+
+    tracing::info!("✅ Connector instance created: {} ({})", body.name, id);
+
+    Ok(Json(json!({
+        "id":             id,
+        "name":           body.name,
+        "connector_type": body.connector_type,
+        "host":           body.host,
+        "port":           body.port,
+        "status":         "created"
+    })))
+}
+
+/// GET /connector-instances
+async fn list_connector_instances(
+    State(state): State<Arc<AppState>>,
+) -> Json<Value> {
+    let instances = state.connector_instances.read().await;
+    let sanitized: Vec<Value> = instances.iter().map(|c| json!({
+        "id":             c.id,
+        "name":           c.name,
+        "connector_type": c.connector_type,
+        "host":           c.host,
+        "port":           c.port,
+        "database":       c.database,
+        "username":       c.username,
+        "active":         c.active,
+        "created_at":     c.created_at,
+        // password_encrypted intentionally omitted
+    })).collect();
+
+    Json(json!({ "connectors": sanitized, "count": sanitized.len() }))
+}
+
+/// GET /connector-instances/:id
+async fn get_connector_instance(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    let instances = state.connector_instances.read().await;
+    let instance = instances.iter().find(|c| c.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("Connector not found: {}", id)))?;
+
+    Ok(Json(json!({
+        "id":             instance.id,
+        "name":           instance.name,
+        "connector_type": instance.connector_type,
+        "host":           instance.host,
+        "port":           instance.port,
+        "database":       instance.database,
+        "username":       instance.username,
+        "active":         instance.active,
+        "created_at":     instance.created_at,
+    })))
+}
+
+/// DELETE /connector-instances/:id
+async fn delete_connector_instance(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    sqlx::query!("DELETE FROM connector_instances WHERE id = $1", id)
+        .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
+
+    state.connector_instances.write().await.retain(|c| c.id != id);
+
+    let event = common::ConnectorInstanceEvent::Deleted { id: id.clone() };
+    publish_connector_instance_event(&state.nats, &event).await?;
+
+    tracing::info!("🗑️  Deleted connector instance: {}", id);
+    Ok(Json(json!({ "deleted": id })))
+}
+
+async fn publish_connector_instance_event(
+    nats: &NatsClient,
+    event: &common::ConnectorInstanceEvent,
+) -> Result<(), AppError> {
+    let payload = serde_json::to_vec(event)
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    nats.publish(event.subject(), payload.into()).await
+        .map_err(|e| AppError::Internal(e.to_string()))?;
+    tracing::debug!("📤 Published {}", event.subject());
+    Ok(())
+}
+
+/// Load connector instances from DB on startup
+async fn load_connector_instances(state: &AppState) -> Result<()> {
+    let rows = sqlx::query!(
+        "SELECT id, name, connector_type, host, port, database_name, username,
+                password_encrypted, extra_attributes, active, created_at
+         FROM connector_instances WHERE active = TRUE"
+    )
+    .fetch_all(&state.db).await?;
+
+    let mut instances = state.connector_instances.write().await;
+    for row in rows {
+        instances.push(common::ConnectorInstance {
+            id:                 row.id,
+            name:               row.name,
+            connector_type:     row.connector_type,
+            host:               row.host,
+            port:               row.port as u16,
+            database:           row.database_name,
+            username:           row.username,
+            password_encrypted: row.password_encrypted,
+            extra_attributes:   row.extra_attributes,
+            active:             row.active,
+            created_at:         row.created_at,
+        });
+    }
+
+    tracing::info!("✅ Loaded {} connector instances from DB", instances.len());
+    Ok(())
+}
+
+
