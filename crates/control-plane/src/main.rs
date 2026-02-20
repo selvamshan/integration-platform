@@ -5,6 +5,8 @@ use axum::{
     extract::{State, Path, Json},
     response::{IntoResponse, Response},
     http::StatusCode,
+    Extension,
+    middleware
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -30,8 +32,13 @@ use common::{
     JwtClaims,
 };
 
-use crypto::CryptoService;
+
 mod crypto;
+mod keycloak;
+mod rbac;
+use crypto::CryptoService;
+use keycloak::KeycloakConfig;
+use rbac::{permission_middleware, rbac_middleware};
 
 type RedisConnection = redis::aio::ConnectionManager;
 
@@ -47,6 +54,7 @@ struct AppState {
     rate_limit_stats: Arc<RwLock<HashMap<String, Vec<RateLimitEvent>>>>,
     jwt_secret:       String,
     crypto:           Arc<CryptoService>,
+    keycloak:         Arc<KeycloakConfig>,
 }
 
 #[tokio::main]
@@ -84,6 +92,26 @@ async fn main() -> Result<()> {
     let crypto = Arc::new(CryptoService::new()?);
     tracing::info!("✅ Encryption service initialized");
 
+    // Initialize Keycloak (optional - falls back to JWT if not configured)
+    let keycloak = match KeycloakConfig::from_env() {
+        Ok(kc) => {
+            tracing::info!("✅ Keycloak integration enabled");
+            Arc::new(kc)
+        }
+        Err(e) => {
+            tracing::warn!("⚠️  Keycloak not configured: {}", e);
+            tracing::warn!("   Falling back to JWT-only authentication");
+            // Create dummy config - won't be used if KEYCLOAK_CLIENT_SECRET not set
+            Arc::new(KeycloakConfig {
+                server_url: String::new(),
+                realm: String::new(),
+                client_id: String::new(),
+                client_secret: String::new(),
+                http_client: reqwest::Client::new(),
+            })
+        }
+    };
+
     run_migrations(&db).await?;
     
     let state = Arc::new(AppState {
@@ -98,6 +126,7 @@ async fn main() -> Result<()> {
         rate_limit_stats: Arc::new(RwLock::new(HashMap::new())),
         jwt_secret,
         crypto,
+        keycloak: keycloak.clone(),
     });
 
     load_flows_from_database(state.clone()).await?;
@@ -162,6 +191,15 @@ async fn main() -> Result<()> {
          // ── Connector Instances ────────────────────────────────────────────
         .route("/connector-instances",     post(create_connector_instance).get(list_connector_instances))
         .route("/connector-instances/:id", get(get_connector_instance).delete(delete_connector_instance))
+        // ── User Management (RBAC) ─────────────────────────────────────────
+        .route("/users/invite",       post(invite_user))
+        .route("/users",              get(list_users))
+        .route("/users/me",           get(get_current_user))
+        .route("/users/:user_id",     delete(delete_user))
+        // ── RBAC Middleware (comment out to disable) ──────────────────────
+        // Uncomment these lines to enable Keycloak-based RBAC:
+        .layer(middleware::from_fn(permission_middleware))
+        .layer(middleware::from_fn_with_state(keycloak.clone(), rbac_middleware))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -264,6 +302,24 @@ async fn run_migrations(db: &PgPool) -> Result<()> {
         active              BOOLEAN      NOT NULL DEFAULT TRUE,
         created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
     )").execute(db).await?;
+
+     // ── User invitations table ────────────────────────────────────────────────
+    sqlx::query("CREATE TABLE IF NOT EXISTS user_invitations (
+        id              VARCHAR(64)  PRIMARY KEY,
+        email           VARCHAR(255) NOT NULL,
+        role            VARCHAR(50)  NOT NULL,
+        invited_by      VARCHAR(64)  NOT NULL,
+        invited_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
+        expires_at      TIMESTAMPTZ  NOT NULL,
+        token           VARCHAR(64)  NOT NULL UNIQUE,
+        accepted        BOOLEAN      NOT NULL DEFAULT FALSE
+    )").execute(db).await?;
+
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_invitations_email 
+                 ON user_invitations(email)").execute(db).await?;
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_invitations_token 
+                 ON user_invitations(token)").execute(db).await?;
+
     let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
     if count.0 == 0 {
         sqlx::query("INSERT INTO users (name, email) VALUES ('Alice Johnson', 'alice@example.com'), ('Bob Smith', 'bob@example.com'), ('Charlie Brown', 'charlie@example.com'), ('Diana Prince', 'diana@example.com'), ('Eve Wilson', 'eve@example.com')").execute(db).await?;
@@ -1318,4 +1374,104 @@ async fn load_connector_instances(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+// ─── User Management Endpoints (Admin Only) ──────────────────────────────────
 
+/// POST /users/invite — Invite a new user (admin only)
+async fn invite_user(
+    State(state): State<Arc<AppState>>,
+    current_user: Option<Extension<common::User>>,
+    Json(body): Json<InviteUserBody>,
+) -> Result<Json<Value>, AppError> {
+    // Extract user - if RBAC is disabled, this will be None
+    let current_user = current_user
+        .ok_or_else(|| AppError::Unauthorized("Authentication required (enable RBAC)".into()))?
+        .0;
+    
+    if !current_user.is_admin() {
+        return Err(AppError::Unauthorized("Admin role required".into()));
+    }
+
+    // Validate role
+    let role = common::UserRole::from_str(&body.role)
+        .ok_or_else(|| AppError::Internal(format!("Invalid role: {}", body.role)))?;
+
+    // Invite user via Keycloak
+    let user_id = state.keycloak.invite_user(&body.email, &role).await
+        .map_err(|e| AppError::Internal(format!("Keycloak invitation failed: {}", e)))?;
+
+    // Store invitation in database
+    let invitation_id = uuid::Uuid::new_v4().to_string();
+    let invitation_token = uuid::Uuid::new_v4().to_string();
+    let expires_at = chrono::Utc::now() + chrono::Duration::days(7);
+
+    sqlx::query!(
+        "INSERT INTO user_invitations (id, email, role, invited_by, invited_at, expires_at, token, accepted)
+         VALUES ($1, $2, $3, $4, NOW(), $5, $6, FALSE)",
+        invitation_id, body.email, role.as_str(), current_user.id, expires_at, invitation_token
+    )
+    .execute(&state.db).await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+
+    tracing::info!("✅ User invited: {} as {} by {}", body.email, role.as_str(), current_user.username);
+
+    Ok(Json(json!({
+        "invitation_id": invitation_id,
+        "email": body.email,
+        "role": role.as_str(),
+        "keycloak_user_id": user_id,
+        "expires_at": expires_at,
+        "status": "invitation_sent"
+    })))
+}
+
+#[derive(serde::Deserialize)]
+struct InviteUserBody {
+    email: String,
+    role: String,  // "admin", "developer", or "viewer"
+}
+
+/// GET /users — List all users (admin only)
+async fn list_users(
+    State(state): State<Arc<AppState>>,
+) -> Result<Json<Value>, AppError> {
+    let users = state.keycloak.list_users().await
+        .map_err(|e| AppError::Internal(format!("Failed to list users: {}", e)))?;
+
+    Ok(Json(json!({
+        "users": users,
+        "count": users.len()
+    })))
+}
+
+/// DELETE /users/:user_id — Delete user (admin only)
+async fn delete_user(
+    State(state): State<Arc<AppState>>,
+    Path(user_id): Path<String>,
+) -> Result<Json<Value>, AppError> {
+    state.keycloak.delete_user(&user_id).await
+        .map_err(|e| AppError::Internal(format!("Failed to delete user: {}", e)))?;
+
+    tracing::info!("🗑️  User deleted: {}", user_id);
+
+    Ok(Json(json!({
+        "deleted": user_id,
+        "status": "success"
+    })))
+}
+
+/// GET /users/me — Get current user info
+async fn get_current_user(
+    request: axum::http::Request<axum::body::Body>,
+) -> Result<Json<Value>, AppError> {
+    tracing::info!("Get current user");
+    let user = request.extensions().get::<common::User>()
+        .ok_or_else(|| AppError::Internal("No user context".into()))?;
+
+    Ok(Json(json!({
+        "id": user.id,
+        "username": user.username,
+        "email": user.email,
+        "name": user.name,
+        "roles": user.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>()
+    })))
+}

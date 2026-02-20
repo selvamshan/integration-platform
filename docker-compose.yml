@@ -62,6 +62,10 @@ services:
       RUST_LOG: control_plane=debug,info
       JWT_SECRET: "${JWT_SECRET:-integration-platform-dev-secret}"
       ENCRYPTION_KEY: "${ENCRYPTION_KEY:-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa}"
+      KEYCLOAK_SERVER_URL: http://keycloak:8080
+      KEYCLOAK_REALM: integration-platform
+      KEYCLOAK_CLIENT_ID: control-plane
+      KEYCLOAK_CLIENT_SECRET: "${KEYCLOAK_CLIENT_SECRET:-ss8OfTRBEqgHHTuRyMcw3Acafu2ON1T2}"
     ports:
       - "8081:8081"
     depends_on:
@@ -95,6 +99,28 @@ services:
         condition: service_healthy
       control-plane:
         condition: service_started
+    networks:
+      - integration-network
+
+  keycloak:
+    image: quay.io/keycloak/keycloak:23.0
+    container_name: integration-keycloak
+    environment:
+      KEYCLOAK_ADMIN: admin
+      KEYCLOAK_ADMIN_PASSWORD: admin123
+      KC_HOSTNAME: localhost
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_PORT: "8080"
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/integration_platform
+      KC_DB_USERNAME: platform
+      KC_DB_PASSWORD: platform123
+    ports:
+      - "8180:8080"  # Keycloak on 8180 to avoid conflict
+    command: start-dev
+    depends_on:
+      postgres:
+        condition: service_healthy
     networks:
       - integration-network
 

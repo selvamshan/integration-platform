@@ -1,0 +1,4 @@
+docker-compose up -d postgres
+$env:DATABASE_URL="postgresql://platform:platform123@localhost:5432/integration_platform"
+cargo sqlx prepare --workspace
+

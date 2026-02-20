@@ -382,3 +382,139 @@ impl ConnectorInstanceEvent {
         }
     }
 }
+
+
+// ─── RBAC (Role-Based Access Control) ───────────────────────────────────────
+
+/// User roles for Control Plane access control
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,      // Full access, user management, invite users
+    Developer,  // Create/update/delete flows, connectors, clients
+    Viewer,     // Read-only: metrics, APIs, connectors, rate limits
+}
+
+impl UserRole {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "admin" => Some(UserRole::Admin),
+            "developer" => Some(UserRole::Developer),
+            "viewer" => Some(UserRole::Viewer),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            UserRole::Admin => "admin",
+            UserRole::Developer => "developer",
+            UserRole::Viewer => "viewer",
+        }
+    }
+
+    /// Check if role has permission for an action
+    pub fn can(&self, action: &Permission) -> bool {
+        match (self, action) {
+            // Admin can do everything
+            (UserRole::Admin, _) => true,
+            
+            // Developer permissions
+            (UserRole::Developer, Permission::ReadFlows) => true,
+            (UserRole::Developer, Permission::WriteFlows) => true,
+            (UserRole::Developer, Permission::DeleteFlows) => true,
+            (UserRole::Developer, Permission::ReadConnectors) => true,
+            (UserRole::Developer, Permission::WriteConnectors) => true,
+            (UserRole::Developer, Permission::DeleteConnectors) => true,
+            (UserRole::Developer, Permission::ReadClients) => true,
+            (UserRole::Developer, Permission::WriteClients) => true,
+            (UserRole::Developer, Permission::DeleteClients) => true,
+            (UserRole::Developer, Permission::ReadApis) => true,
+            (UserRole::Developer, Permission::WriteApis) => true,
+            (UserRole::Developer, Permission::DeleteApis) => true,
+            (UserRole::Developer, Permission::ReadMetrics) => true,
+            (UserRole::Developer, Permission::ReadRateLimits) => true,
+            
+            // Viewer permissions (read-only)
+            (UserRole::Viewer, Permission::ReadFlows) => true,
+            (UserRole::Viewer, Permission::ReadConnectors) => true,
+            (UserRole::Viewer, Permission::ReadApis) => true,
+            (UserRole::Viewer, Permission::ReadMetrics) => true,
+            (UserRole::Viewer, Permission::ReadRateLimits) => true,
+            (UserRole::Viewer, Permission::ReadClients) => true,
+            
+            // Deny everything else
+            _ => false,
+        }
+    }
+}
+
+/// Permissions for fine-grained access control
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Permission {
+    // Flow permissions
+    ReadFlows,
+    WriteFlows,
+    DeleteFlows,
+    
+    // Connector permissions
+    ReadConnectors,
+    WriteConnectors,
+    DeleteConnectors,
+    
+    // API permissions
+    ReadApis,
+    WriteApis,
+    DeleteApis,
+    
+    // Client permissions
+    ReadClients,
+    WriteClients,
+    DeleteClients,
+    
+    // Monitoring permissions
+    ReadMetrics,
+    ReadRateLimits,
+    
+    // User management (admin only)
+    ManageUsers,
+    InviteUsers,
+}
+
+/// User principal with Keycloak information
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct User {
+    pub id: String,              // Keycloak user ID
+    pub username: String,
+    pub email: String,
+    pub roles: Vec<UserRole>,
+    pub name: Option<String>,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl User {
+    pub fn has_role(&self, role: &UserRole) -> bool {
+        self.roles.contains(role)
+    }
+
+    pub fn can(&self, permission: &Permission) -> bool {
+        self.roles.iter().any(|role| role.can(permission))
+    }
+
+    pub fn is_admin(&self) -> bool {
+        self.has_role(&UserRole::Admin)
+    }
+}
+
+/// User invitation for admin-initiated onboarding
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserInvitation {
+    pub id: String,
+    pub email: String,
+    pub role: UserRole,
+    pub invited_by: String,      // Admin user ID
+    pub invited_at: chrono::DateTime<chrono::Utc>,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
+    pub accepted: bool,
+    pub token: String,           // Unique invitation token
+}

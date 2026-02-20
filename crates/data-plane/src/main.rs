@@ -1012,18 +1012,24 @@ async fn execute_flow(
 
 async fn trigger_flow(
     State(state): State<Arc<AppState>>,
+    method: axum::http::Method,
     Path(path): Path<String>,
+    body: Option<Json<Value>>,
 ) -> Result<Json<Value>, AppError> {
-    tracing::info!("🎯 HTTP Trigger: GET /{}", path);
-    FLOW_EXECUTIONS_TOTAL.inc();
-    let start = Instant::now();
+    let method_str = method.as_str();
+    tracing::info!("🎯 HTTP Trigger: {} /{}", method_str, path);
     
+    // Find flow matching both path AND method
     let flow = {
         let flows = state.flows.read().await;
         flows.values()
             .find(|f| {
-                if let common::Trigger::Http { path: trigger_path, method } = &f.trigger {
-                    method == "GET" && trigger_path.contains(&path)
+                if let common::Trigger::Http { path: trigger_path, method: trigger_method } = &f.trigger {
+                    // Match both path and method
+                    let path_matches = trigger_path == &path || 
+                                      trigger_path.trim_start_matches('/') == path.trim_start_matches('/');
+                    let method_matches = trigger_method.to_uppercase() == method_str.to_uppercase();
+                    path_matches && method_matches
                 } else {
                     false
                 }
@@ -1034,25 +1040,38 @@ async fn trigger_flow(
     let flow = if let Some(f) = flow {
         f
     } else {
-        tracing::warn!("No flow found for /{}, using default flow", path);
-        create_default_flow(&path)
+        return Err(AppError::NotFound(format!(
+            "No flow registered for {} /{}", 
+            method_str, path
+        )));
     };
     
     let flow_id = flow.id.clone();
-
+    
     // Connect flow connectors dynamically before execution
     connect_flow_connectors(&state, &flow).await
         .map_err(|e| AppError::Internal(format!("Connector setup failed: {}", e)))?;
-
-    let cb_policy = flow.circuit_breaker.clone(); 
-    let retry_policy = flow.retry.clone();       
     
-    let input = Message::new(json!({
+    let cb_policy = flow.circuit_breaker.clone();
+    let retry_policy = flow.retry.clone();
+    
+    // Build input message with method, path, and body (if present)
+    let mut payload = json!({
         "trigger": "http",
         "path": format!("/{}", path),
-        "method": "GET"
-    }));    
-   
+        "method": method_str
+    });
+    
+    // Add body for POST/PUT/DELETE if provided
+    if let Some(Json(body_data)) = body {
+        payload["body"] = body_data;
+    }
+    
+    let input = Message::new(payload);
+    
+    FLOW_EXECUTIONS_TOTAL.inc();
+    let start = Instant::now();
+    
     // Execute with retry if policy exists
     let result = if let Some(ref policy) = retry_policy {
         let executor = state.executor.clone();
@@ -1080,28 +1099,31 @@ async fn trigger_flow(
     match result {
         Ok(output) => {
             FLOW_EXECUTIONS_SUCCESS.inc();
+            
+            // Update circuit breaker on success
             if let Some(policy) = cb_policy {
                 update_circuit_breaker_on_success(state.clone(), flow_id.clone(), policy).await;
             }
             
-            tracing::info!("✅ Flow {} completed in {:.3}s", flow_id, duration);
+            tracing::info!("✅ Trigger flow {} completed in {:.3}s", flow_id, duration);
             Ok(Json(output.payload))
         }
         Err(e) => {
             FLOW_EXECUTIONS_FAILED.inc();
+            
             // Update circuit breaker on failure
             if let Some(policy) = cb_policy {
-                tracing::info!("{:?}", policy);
                 update_circuit_breaker_on_failure(state.clone(), flow_id.clone(), policy).await;
             }
-            tracing::error!("❌ Flow {} failed after {:.3}s: {}", flow_id, duration, e);
+            
+            tracing::error!("❌ Trigger flow {} failed after {:.3}s: {}", flow_id, duration, e);
             Err(AppError::Internal(e.to_string()))
         }
     }
 }
 
 // Helper function for backward compatibility
-fn create_default_flow(path: &str) -> FlowDefinition {
+fn _create_default_flow(path: &str) -> FlowDefinition {
     use common::{Trigger, FlowStep};
     
     FlowDefinition {
