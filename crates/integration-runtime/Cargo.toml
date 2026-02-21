@@ -14,3 +14,4 @@ tracing = { workspace = true }
 sqlx = { workspace = true }
 reqwest = { workspace = true }
 async-trait = { workspace = true }
+base64 = "0.21"
