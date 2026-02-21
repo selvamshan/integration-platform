@@ -37,9 +37,12 @@ pub enum Error {
     
     #[error("Flow execution error: {0}")]
     Flow(String),
+
+    #[error("Transform error: {0}")]
+    Transform(String),
     
     #[error("Authentication error: {0}")]
-    Auth(String),
+    Auth(String),    
     
     #[error("Rate limit exceeded")]
     RateLimit,
@@ -295,7 +298,7 @@ pub enum FlowStep {
     },
     Transform {
         name: String,
-        script: String,
+        spec: serde_json::Value
     },
 }
 

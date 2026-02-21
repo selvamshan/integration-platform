@@ -309,7 +309,7 @@ async fn main() -> Result<()> {
     // Protected routes: require authentication
     let protected = Router::new()
         .route("/flows/:flow_id/execute", post(execute_flow))
-        .route("/api/trigger/:path", get(trigger_flow))
+        .route("/api/trigger/:path", get(trigger_flow).post(trigger_flow).put(trigger_flow).delete(trigger_flow))
         .layer(middleware::from_fn_with_state(state.clone(), circuit_breaker_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .layer(middleware::from_fn_with_state(auth_cfg, auth_middleware));

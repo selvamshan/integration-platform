@@ -1,12 +1,14 @@
 use common::{Message, Result, Error, FlowDefinition, FlowStep, Connector};
-use std::sync::Arc;
+//use std::sync::Arc;
 use std::collections::HashMap;
 use tracing::{info, error};
 
 pub mod connectors;
+pub mod transformers;
 
-use connectors::http::HttpConnector;
-use connectors::postgres::PostgresConnector;
+// use connectors::http::HttpConnector;
+// use connectors::postgres::PostgresConnector;
+use transformers::json::TransformEngine;
 
 /// Integration runtime executor
 pub struct FlowExecutor {
@@ -58,10 +60,37 @@ impl FlowExecutor {
                     info!("   ✅ Connector call completed");
                 }
                 
-                FlowStep::Transform { name, script } => {
+                FlowStep::Transform { name, spec } => {
                     info!("🔄 [{}] Transforming data", name);
-                    // Simple script evaluation (just log for now)
-                    info!("   Script: {}", script);
+                    
+                    // Determine what data to transform
+                    // If payload has a "body" field (from HTTP trigger), transform that
+                    // Otherwise transform the whole payload
+                    let data_to_transform = if let Some(body) = current_output.payload.get("body") {
+                        body
+                    } else {
+                        &current_output.payload
+                    };
+                    
+                    // Apply transformation using TransformEngine
+                    let transformed = TransformEngine::transform(data_to_transform, spec)
+                        .map_err(|e| {
+                            error!("   ❌ Transform failed: {}", e);
+                            e
+                        })?;
+                    
+                    // Update current output
+                    // If we transformed the body, replace it; otherwise replace the whole payload
+                    if current_output.payload.get("body").is_some() {
+                        if let serde_json::Value::Object(ref mut map) = current_output.payload {
+                            map.insert("body".to_string(), transformed);
+                        }
+                    } else {
+                        current_output.payload = transformed;
+                    }
+                    
+                    info!("   ✅ Transform completed");
+                    info!("   Output: {}", serde_json::to_string_pretty(&current_output.payload).unwrap_or_default());
                 }
             }
         }

@@ -36,6 +36,7 @@ use common::{
 mod crypto;
 mod keycloak;
 mod rbac;
+mod transformers;
 use crypto::CryptoService;
 use keycloak::KeycloakConfig;
 use rbac::{permission_middleware, rbac_middleware};
@@ -175,6 +176,9 @@ async fn main() -> Result<()> {
         // Flow routes
         .route("/flows", get(list_flows).post(create_flow))
         .route("/flows/:id", get(get_flow).put(update_flow).delete(delete_flow))
+        .route("/transformers",     get(transformers::list_transformers))
+        .route("/transformers/:id", get(transformers::get_transformer))
+        .route("/transformers/capabilities", get(transformers::get_transformer_capabilities))
         // Connector registry routes (for UI palette)
         .route("/connectors", get(list_connectors))
         .route("/connectors/:id", get(get_connector))
