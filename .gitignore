@@ -17,5 +17,8 @@ Thumbs.db
 .env
 .env.local
 
+# Frontend
+frontend/node_modules/
+
 # Logs
 *.log

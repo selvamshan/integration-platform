@@ -4,7 +4,7 @@ use axum::{
     routing::{get, post, put, delete},
     extract::{State, Path, Json},
     response::{IntoResponse, Response},
-    http::StatusCode,
+    http::{header, HeaderMap, HeaderValue, StatusCode, Method},
     Extension,
     middleware
 };
@@ -14,6 +14,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
+use tower_http::cors::{CorsLayer, Any};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use async_nats::Client as NatsClient;
@@ -167,6 +168,26 @@ async fn main() -> Result<()> {
         }
     });
 
+    let cors = CorsLayer::new()
+    .allow_origin(
+        "http://localhost:3000"
+            .parse::<HeaderValue>()
+            .unwrap(),
+    )
+    .allow_methods([
+        Method::GET,
+        Method::POST,
+        Method::OPTIONS, // 🔥 REQUIRED
+    ])
+    // 🔥 FIX: Replace 'Any' with an explicit list
+    .allow_headers([
+        header::AUTHORIZATION,
+        header::CONTENT_TYPE,
+        header::ACCEPT,
+        header::X_CONTENT_TYPE_OPTIONS, // Common for some AJAX libs
+    ])
+    .allow_credentials(true);
+
     let app = Router::new()
         .route("/", get(root))
         .route("/health", get(health_check))
@@ -183,7 +204,7 @@ async fn main() -> Result<()> {
         .route("/connectors", get(list_connectors))
         .route("/connectors/:id", get(get_connector))
         // Trigger registry routes (for UI palette)
-        .route("/triggers", get(list_triggers))
+        .route("/triggers", get(list_triggers))        
         .route("/triggers/:id", get(get_trigger))
         // ── Rate-limit stats ──────────────────────────────────────────────
         .route("/rate-limits", get(get_rate_limit_stats))
@@ -195,7 +216,8 @@ async fn main() -> Result<()> {
          // ── Connector Instances ────────────────────────────────────────────
         .route("/connector-instances",     post(create_connector_instance).get(list_connector_instances))
         .route("/connector-instances/:id", get(get_connector_instance).delete(delete_connector_instance))
-        // ── User Management (RBAC) ─────────────────────────────────────────
+        .route("/connector-instances/type/:connector_type", get(list_connector_instances_by_type))
+          // ── User Management (RBAC) ─────────────────────────────────────────
         .route("/users/invite",       post(invite_user))
         .route("/users",              get(list_users))
         .route("/users/me",           get(get_current_user))
@@ -204,6 +226,7 @@ async fn main() -> Result<()> {
         // Uncomment these lines to enable Keycloak-based RBAC:
         .layer(middleware::from_fn(permission_middleware))
         .layer(middleware::from_fn_with_state(keycloak.clone(), rbac_middleware))
+        .layer(cors)        
         .layer(TraceLayer::new_for_http())
         .with_state(state);
 
@@ -1207,6 +1230,7 @@ async fn issue_token(
     })))
 }
 
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Connector Instances — Dynamic registration with encrypted credentials
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1297,6 +1321,7 @@ async fn list_connector_instances(
     Json(json!({ "connectors": sanitized, "count": sanitized.len() }))
 }
 
+
 /// GET /connector-instances/:id
 async fn get_connector_instance(
     State(state): State<Arc<AppState>>,
@@ -1317,7 +1342,29 @@ async fn get_connector_instance(
         "active":         instance.active,
         "created_at":     instance.created_at,
     })))
+    
 }
+
+// Add handler after list_connector_instances
+async fn list_connector_instances_by_type(
+    State(state): State<Arc<AppState>>,
+    Path(connector_type): Path<String>,
+) -> Json<Value> {
+    let instances = state.connector_instances.read().await;
+    let filtered: Vec<Value> = instances
+        .iter()
+        .filter(|c| c.connector_type == connector_type)
+        .map(|c| json!({
+            "id": c.id,
+            "name": c.name,
+            "connector_type": c.connector_type,
+            "host": c.host,
+            "active": c.active,
+        }))
+        .collect();
+    Json(json!({ "instances": filtered }))
+}
+
 
 /// DELETE /connector-instances/:id
 async fn delete_connector_instance(
