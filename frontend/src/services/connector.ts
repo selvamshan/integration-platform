@@ -12,6 +12,11 @@ export const connectorService = {
     return res.data
   },
   
+  async update(id: string, connector: Connector) {
+    const res = await api.put(`/connector-instances/${id}`, connector)
+    return res.data
+  },
+
   async delete(id: string) {
     await api.delete(`/connector-instances/${id}`)
   },

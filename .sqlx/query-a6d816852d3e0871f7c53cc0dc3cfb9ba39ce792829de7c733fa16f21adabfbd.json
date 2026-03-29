@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE connector_instances\n        SET name = $1, connector_type = $2, host = $3, port = $4,\n            database_name = $5, username = $6, password_encrypted = $7, active = $8,\n            extra_attributes = $9\n        WHERE id = $10\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Varchar",
+        "Varchar",
+        "Varchar",
+        "Int4",
+        "Varchar",
+        "Varchar",
+        "Text",
+        "Bool",
+        "Jsonb",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "a6d816852d3e0871f7c53cc0dc3cfb9ba39ce792829de7c733fa16f21adabfbd"
+}

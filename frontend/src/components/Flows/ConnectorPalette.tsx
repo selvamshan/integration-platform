@@ -17,6 +17,7 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
   // Expandable sections
   const [expandedSections, setExpandedSections] = useState({
     triggers: true,
+    actions: true,
     transforms: true,
     connectors: true,
   })
@@ -85,6 +86,39 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
               onClick={() => onAddNode('trigger', trigger)}
             />
           ))}
+        </Section>
+
+        {/* Actions Section */}
+        <Section
+          title="Actions"
+          count={2}
+          expanded={expandedSections.actions}
+          onToggle={() => toggleSection('actions')}
+        >
+          <PaletteItem
+            icon="📋"
+            name="Log Info"
+            description="Log a message to the flow execution output"
+            color="green"
+            onClick={() => onAddNode('log', {
+              id: 'log-info',
+              name: 'Log Info',
+              icon: '📋',
+              type: 'log',
+            })}
+          />
+          <PaletteItem
+            icon="🚦"
+            name="Rate Limit"
+            description="Limit requests per IP, user, or globally with a configurable window"
+            color="red"
+            onClick={() => onAddNode('rate_limit', {
+              id: 'rate-limit',
+              name: 'Rate Limit',
+              icon: '🚦',
+              type: 'rate_limit',
+            })}
+          />
         </Section>
 
         {/* Transforms Section */}
@@ -185,13 +219,15 @@ function PaletteItem({
   name: string
   description: string
   operations?: string[]
-  color: 'blue' | 'amber' | 'purple'
+  color: 'blue' | 'amber' | 'purple' | 'green' | 'red'
   onClick: () => void
 }) {
   const colorClasses = {
     blue: 'bg-blue-50 border-blue-200 hover:bg-blue-100 hover:border-blue-300',
     amber: 'bg-amber-50 border-amber-200 hover:bg-amber-100 hover:border-amber-300',
     purple: 'bg-purple-50 border-purple-200 hover:bg-purple-100 hover:border-purple-300',
+    green: 'bg-green-50 border-green-200 hover:bg-green-100 hover:border-green-300',
+    red: 'bg-red-50 border-red-200 hover:bg-red-100 hover:border-red-300',
   }
 
   return (

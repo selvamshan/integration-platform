@@ -86,16 +86,22 @@ impl ConnectorRegistry {
         }
 
         // Decrypt password
-        let password = self.crypto.decrypt(&instance.password_encrypted)?;
+        let password = match &instance.password_encrypted {
+            Some(enc) => self.crypto.decrypt(enc)?,
+            None => String::new(),
+        };
 
         match instance.connector_type.as_str() {
             "postgres" => {
                 let database = instance.database.as_ref()
                     .ok_or_else(|| anyhow::anyhow!("Postgres connector requires database field"))?;
 
+                let port = instance.port.unwrap_or(5432);
+                let username = instance.username.as_deref().unwrap_or("platform");
+                let host = instance.host.as_deref().unwrap_or("localhost");
                 let url = format!(
                     "postgresql://{}:{}@{}:{}/{}",
-                    instance.username, password, instance.host, instance.port, database
+                    username, password, host, port, database
                 );
 
                 let mut conn = PostgresConnector::new(url);

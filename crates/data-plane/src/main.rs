@@ -2,14 +2,14 @@ use anyhow::Result;
 use axum::{
     Router,
     routing::{get, post},
-    extract::{State, Path, Json},
+    extract::{State, Path, Json, Query},
     response::{IntoResponse, Response},
     http::{StatusCode, Request, HeaderMap},
     middleware::{self, Next},
     body::Body,
 };
 use serde_json::{json, Value};
-use std::{arch::x86_64::CpuidResult, sync::Arc};
+use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -35,23 +35,23 @@ use common::{
     Message, 
     FlowDefinition, 
     ConfigUpdate, 
-    Connector, 
     RateLimitPolicy, 
     RateLimitKeyType, 
     RateLimitEvent,
     CircuitBreakerPolicy, 
-    CircuitState,
-    RetryPolicy
+    CircuitState,   
 };
 use integration_runtime::FlowExecutor;
-use integration_runtime::connectors::{http::HttpConnector, postgres::PostgresConnector};
+//use integration_runtime::connectors::{http::HttpConnector, postgres::PostgresConnector};
 
 mod retry;
 mod auth;
 mod connector_registry;
+mod scheduler;
 //use retry::with_retry;
 use auth::{auth_middleware, AuthConfig};
 use connector_registry::{ConnectorRegistry, CryptoService};
+use scheduler::FlowScheduler;
 
 type RedisConnection = redis::aio::ConnectionManager;
 
@@ -199,6 +199,7 @@ struct AppState {
     redis: RedisConnection,
     node_id: String,
     jwt_secret: String,
+    scheduler:Arc<FlowScheduler>,
 }
 
 #[tokio::main]
@@ -240,21 +241,12 @@ async fn main() -> Result<()> {
     tracing::info!("✅ NATS connected");
 
     // Initialize flow executor
-    let mut executor = FlowExecutor::new();
+    let executor = FlowExecutor::new();
     
-    // Register HTTP connector
-    let mut http_connector = HttpConnector::new();
-    http_connector.connect().await?;
-    executor.register_connector("http".to_string(), Box::new(http_connector));
-    
-    // // Register PostgreSQL connector
-    // let db_url = std::env::var("DATABASE_URL")
-    //     .unwrap_or_else(|_| "postgresql://platform:platform123@postgres:5432/integration_platform".to_string());
-    
-    // let mut postgres_connector = PostgresConnector::new(db_url);
-    // postgres_connector.connect().await?;
-    // executor.register_connector("postgres".to_string(), Box::new(postgres_connector));
-    
+    let scheduler = Arc::new(FlowScheduler::new("UTC").await?);
+    scheduler.start().await?;
+    tracing::info!("✅ Flow scheduler started");
+
    tracing::info!("✅ HTTP connector initialized (DB connectors registered on-demand)");
 
    // Initialize crypto service for decrypting connector passwords
@@ -276,7 +268,11 @@ async fn main() -> Result<()> {
         redis,
         node_id: node_id.clone(),
         jwt_secret: jwt_secret.clone(),
+        scheduler,
     });
+
+    // Load and schedule flows
+    load_scheduled_flows(&state).await?;
 
     // Start NATS event listener
     let listener_state = state.clone();
@@ -309,7 +305,7 @@ async fn main() -> Result<()> {
     // Protected routes: require authentication
     let protected = Router::new()
         .route("/flows/:flow_id/execute", post(execute_flow))
-        .route("/api/trigger/:path", get(trigger_flow).post(trigger_flow).put(trigger_flow).delete(trigger_flow))
+        .route("/api/trigger/*path", get(trigger_flow).post(trigger_flow).put(trigger_flow).delete(trigger_flow))
         .layer(middleware::from_fn_with_state(state.clone(), circuit_breaker_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .layer(middleware::from_fn_with_state(auth_cfg, auth_middleware));
@@ -321,6 +317,8 @@ async fn main() -> Result<()> {
         .route("/metrics", get(metrics_handler))
         .route("/circuit-breakers", get(circuit_breaker_status))
         .route("/flows", get(list_flows));
+
+    let scheduler = state.scheduler.clone();
 
     let app = public
         .merge(protected)
@@ -337,9 +335,12 @@ async fn main() -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app).await?;
+    // Cleanup on shutdown
+    scheduler.shutdown().await?;
 
     Ok(())
 }
+
 
 
 fn current_timestamp() -> u64 {
@@ -799,7 +800,7 @@ async fn listen_for_config_updates(state: Arc<AppState>) -> Result<()> {
             Ok(event) => {
                 tracing::info!("📥 Received event from {}: {:?}", subject, event);
                 
-                if let Err(e) = handle_config_update(&state, event).await {
+                if let Err(e) = handle_config_update(state.clone(), event).await {
                     tracing::error!("Failed to handle config update: {}", e);
                 }
             }
@@ -812,26 +813,38 @@ async fn listen_for_config_updates(state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-async fn handle_config_update(state: &AppState, event: ConfigUpdate) -> Result<()> {
+async fn handle_config_update(state: Arc<AppState>, event: ConfigUpdate) -> Result<()> {
     match event {
-        ConfigUpdate::FlowCreated { flow } => {
-            tracing::info!("➕ Adding flow: {} ({})", flow.name, flow.id);
-            let mut flows = state.flows.write().await;
-            flows.insert(flow.id.clone(), flow);
+        ConfigUpdate::FlowCreated { flow } | ConfigUpdate::FlowUpdated { flow } => {
+            let is_update = state.flows.read().await.contains_key(&flow.id);
+            tracing::info!("{} flow: {} ({})", if is_update { "🔄 Updating" } else { "➕ Adding" }, flow.name, flow.id);
+
+            // Schedule if it's a schedule-triggered flow
+            if let common::Trigger::Schedule { cron } = &flow.trigger {
+                let state_clone = state.clone();
+                let executor = move |flow_id: String, context: Value| {
+                    let s = state_clone.clone();
+                    tokio::spawn(async move {
+                        execute_flow_inner(&s, &flow_id, context).await
+                    })
+                };
+                state.scheduler.schedule_flow(
+                    flow.id.clone(),
+                    flow.name.clone(),
+                    cron,
+                    executor,
+                ).await?;
+            }
+
+            state.flows.write().await.insert(flow.id.clone(), flow);
             tracing::info!("✅ Flow registered in data plane");
         }
-        
-        ConfigUpdate::FlowUpdated { flow } => {
-            tracing::info!("🔄 Updating flow: {} ({})", flow.name, flow.id);
-            let mut flows = state.flows.write().await;
-            flows.insert(flow.id.clone(), flow);
-            tracing::info!("✅ Flow updated in data plane");
-        }
-        
+
         ConfigUpdate::FlowDeleted { flow_id } => {
             tracing::info!("➖ Removing flow: {}", flow_id);
-            let mut flows = state.flows.write().await;
-            flows.remove(&flow_id);
+            // Unschedule if it was a scheduled flow
+            let _ = state.scheduler.unschedule_flow(&flow_id).await;
+            state.flows.write().await.remove(&flow_id);
             tracing::info!("✅ Flow removed from data plane");
         }
         
@@ -927,41 +940,37 @@ where
 }
 
 
-async fn execute_flow(
-    State(state): State<Arc<AppState>>,
-    Path(flow_id): Path<String>,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, AppError> {
+async fn execute_flow_inner(state: &Arc<AppState>, flow_id: &str, payload: Value) -> Result<Value> {
     tracing::info!("📨 Executing flow: {}", flow_id);
-    
+
     FLOW_EXECUTIONS_TOTAL.inc();
     let start = Instant::now();
-    
+
     let flow = {
         let flows = state.flows.read().await;
-        flows.get(&flow_id).cloned()
+        flows.get(flow_id).cloned()
     };
-    
-    let flow = flow.ok_or_else(|| AppError::NotFound(format!("Flow not found: {}", flow_id)))?;
-    
-     // Connect flow connectors dynamically before execution
-    connect_flow_connectors(&state, &flow).await
-        .map_err(|e| AppError::Internal(format!("Connector setup failed: {}", e)))?;
+
+    let flow = flow.ok_or_else(|| anyhow::anyhow!("Flow not found: {}", flow_id))?;
+
+    // Connect flow connectors dynamically before execution
+    connect_flow_connectors(state, &flow).await
+        .map_err(|e| anyhow::anyhow!("Connector setup failed: {}", e))?;
 
     let cb_policy = flow.circuit_breaker.clone();
     let retry_policy = flow.retry.clone();
 
     let input = Message::new(payload);
-    
+
     // Execute with retry if policy exists
     let result = if let Some(ref policy) = retry_policy {
         let executor = state.executor.clone();
         let flow_clone = flow.clone();
-        let input_clone = input.clone();        
-        execute_with_retry(policy, &flow_id, move || {
+        let input_clone = input.clone();
+        execute_with_retry(policy, flow_id, move || {
             let executor = executor.clone();
             let flow = flow_clone.clone();
-            let input = input_clone.clone();            
+            let input = input_clone.clone();
             async move {
                 let executor = executor.read().await;
                 executor.execute_flow(&flow, input).await
@@ -971,22 +980,21 @@ async fn execute_flow(
         let executor = state.executor.read().await;
         executor.execute_flow(&flow, input).await
     };
-    
+
     let duration = start.elapsed().as_secs_f64();
     FLOW_EXECUTION_DURATION.observe(duration);
-    
+
     match result {
         Ok(output) => {
             FLOW_EXECUTIONS_SUCCESS.inc();
-            
-            // Update circuit breaker on success
+
             if let Some(policy) = cb_policy {
-                update_circuit_breaker_on_success(state.clone(), flow_id.clone(), policy).await;
+                update_circuit_breaker_on_success(state.clone(), flow_id.to_string(), policy).await;
             }
-            
+
             tracing::info!("✅ Flow {} completed in {:.3}s", flow_id, duration);
-            
-            Ok(Json(json!({
+
+            Ok(json!({
                 "flow_id": flow_id,
                 "flow_name": flow.name,
                 "status": "completed",
@@ -994,58 +1002,88 @@ async fn execute_flow(
                 "timestamp": output.timestamp,
                 "duration_seconds": duration,
                 "node_id": state.node_id
-            })))
+            }))
         }
         Err(e) => {
             FLOW_EXECUTIONS_FAILED.inc();
-            
-            // Update circuit breaker on failure
+
             if let Some(policy) = cb_policy {
-                update_circuit_breaker_on_failure(state.clone(), flow_id.clone(), policy).await;
+                update_circuit_breaker_on_failure(state.clone(), flow_id.to_string(), policy).await;
             }
-            
+
             tracing::error!("❌ Flow {} failed after {:.3}s: {}", flow_id, duration, e);
-            Err(AppError::Internal(e.to_string()))
+            Err(e.into())
         }
     }
+}
+
+async fn execute_flow(
+    State(state): State<Arc<AppState>>,
+    Path(flow_id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    execute_flow_inner(&state, &flow_id, payload)
+        .await
+        .map(Json)
+        .map_err(|e| AppError::Internal(e.to_string()))
+}
+
+/// Match a parameterized pattern like `/users/:userId` against an actual path like `users/1`.
+/// Returns `Some(HashMap)` of extracted params on match, `None` otherwise.
+fn match_path_pattern(pattern: &str, actual: &str) -> Option<HashMap<String, String>> {
+    let pattern = pattern.trim_start_matches('/');
+    let actual = actual.trim_start_matches('/');
+    let pattern_parts: Vec<&str> = pattern.split('/').collect();
+    let actual_parts: Vec<&str> = actual.split('/').collect();
+    if pattern_parts.len() != actual_parts.len() {
+        return None;
+    }
+    let mut params = HashMap::new();
+    for (pp, ap) in pattern_parts.iter().zip(actual_parts.iter()) {
+        if let Some(param_name) = pp.strip_prefix(':') {
+            params.insert(param_name.to_string(), ap.to_string());
+        } else if pp != ap {
+            return None;
+        }
+    }
+    Some(params)
 }
 
 async fn trigger_flow(
     State(state): State<Arc<AppState>>,
     method: axum::http::Method,
     Path(path): Path<String>,
+    Query(query_params): Query<HashMap<String, String>>,
+    headers: HeaderMap,
     body: Option<Json<Value>>,
 ) -> Result<Json<Value>, AppError> {
     let method_str = method.as_str();
     tracing::info!("🎯 HTTP Trigger: {} /{}", method_str, path);
-    
-    // Find flow matching both path AND method
-    let flow = {
+
+    // Find flow matching both path AND method (supports :param patterns)
+    let (flow, path_params) = {
         let flows = state.flows.read().await;
-        flows.values()
-            .find(|f| {
-                if let common::Trigger::Http { path: trigger_path, method: trigger_method } = &f.trigger {
-                    // Match both path and method
-                    let path_matches = trigger_path == &path || 
-                                      trigger_path.trim_start_matches('/') == path.trim_start_matches('/');
-                    let method_matches = trigger_method.to_uppercase() == method_str.to_uppercase();
-                    path_matches && method_matches
-                } else {
-                    false
+        let mut matched = None;
+        for f in flows.values() {
+            if let common::Trigger::Http { path: trigger_path, method: trigger_method } = &f.trigger {
+                if trigger_method.to_uppercase() != method_str.to_uppercase() {
+                    continue;
                 }
-            })
-            .cloned()
+                if let Some(params) = match_path_pattern(trigger_path, &path) {
+                    matched = Some((f.clone(), params));
+                    break;
+                }
+            }
+        }
+        match matched {
+            Some(pair) => pair,
+            None => return Err(AppError::NotFound(format!(
+                "No flow registered for {} /{}",
+                method_str, path
+            ))),
+        }
     };
-    
-    let flow = if let Some(f) = flow {
-        f
-    } else {
-        return Err(AppError::NotFound(format!(
-            "No flow registered for {} /{}", 
-            method_str, path
-        )));
-    };
-    
+
     let flow_id = flow.id.clone();
     
     // Connect flow connectors dynamically before execution
@@ -1055,18 +1093,38 @@ async fn trigger_flow(
     let cb_policy = flow.circuit_breaker.clone();
     let retry_policy = flow.retry.clone();
     
-    // Build input message with method, path, and body (if present)
-    let mut payload = json!({
-        "trigger": "http",
-        "path": format!("/{}", path),
-        "method": method_str
+    // Build input message structured as {{ trigger.query_params.X }}, etc.
+    let query_params_obj: serde_json::Map<String, Value> = query_params
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+
+    let headers_obj: serde_json::Map<String, Value> = headers
+        .iter()
+        .filter_map(|(k, v)| {
+            v.to_str().ok().map(|s| (k.as_str().to_lowercase(), Value::String(s.to_string())))
+        })
+        .collect();
+
+    let body_data = body.map(|Json(b)| b).unwrap_or(Value::Null);
+
+    let path_params_obj: serde_json::Map<String, Value> = path_params
+        .into_iter()
+        .map(|(k, v)| (k, Value::String(v)))
+        .collect();
+
+    let payload = json!({
+        "trigger": {
+            "type": "http",
+            "path": format!("/{}", path),
+            "method": method_str,
+            "query_params": query_params_obj,
+            "path_params": path_params_obj,
+            "headers": headers_obj,
+            "body": body_data
+        }
     });
-    
-    // Add body for POST/PUT/DELETE if provided
-    if let Some(Json(body_data)) = body {
-        payload["body"] = body_data;
-    }
-    
+
     let input = Message::new(payload);
     
     FLOW_EXECUTIONS_TOTAL.inc();
@@ -1120,6 +1178,32 @@ async fn trigger_flow(
             Err(AppError::Internal(e.to_string()))
         }
     }
+}
+
+async fn load_scheduled_flows(state: &Arc<AppState>) -> Result<()> {
+    // Load flows from database
+    let flows: Vec<FlowDefinition> = state.flows.read().await.values().cloned().collect();
+
+    for flow in flows {
+        if let common::Trigger::Schedule { cron } = &flow.trigger {
+            let state_clone = state.clone();
+            let executor = move |flow_id: String, context: Value| {
+                let state = state_clone.clone();
+                tokio::spawn(async move {
+                    execute_flow_inner(&state, &flow_id, context).await
+                })
+            };
+
+            state.scheduler.schedule_flow(
+                flow.id.clone(),
+                flow.name.clone(),
+                cron,
+                executor,
+            ).await?;
+        }
+    }
+    
+    Ok(())
 }
 
 // Helper function for backward compatibility

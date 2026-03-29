@@ -6,8 +6,9 @@ const TYPE_LABEL: Record<string, string> = {
   http: 'HTTP',
 }
 
-export function ConnectorList({ connectors, onDelete }: {
+export function ConnectorList({ connectors, onEdit, onDelete }: {
   connectors: ConnectorInstance[]
+  onEdit: (connector: ConnectorInstance) => void
   onDelete: (id: string) => void
 }) {
   if (connectors.length === 0) {
@@ -41,12 +42,20 @@ export function ConnectorList({ connectors, onDelete }: {
             </p>
             <p className="text-xs text-gray-400 mt-0.5">ID: {c.id}</p>
           </div>
-          <button
-            onClick={() => onDelete(c.id)}
-            className="btn btn-danger"
-          >
-            Delete
-          </button>
+          <div className="flex gap-2">
+            <button
+              onClick={() => onEdit(c)}
+              className="btn btn-secondary"
+            >
+              Edit
+            </button>
+            <button
+              onClick={() => onDelete(c.id)}
+              className="btn btn-danger"
+            >
+              Delete
+            </button>
+          </div>
         </div>
       ))}
     </div>

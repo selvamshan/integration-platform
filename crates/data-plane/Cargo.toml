@@ -34,3 +34,6 @@ bcrypt = { workspace = true }
 aes-gcm = { workspace = true }
 hex = { workspace = true }
 base64 = { workspace = true }
+tokio-cron-scheduler = "0.10"
+cron = "0.12"
+chrono-tz = "0.8"

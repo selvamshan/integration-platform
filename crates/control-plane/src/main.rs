@@ -2,9 +2,8 @@ use anyhow::Result;
 use axum::{
     Router,
     routing::{get, post, put, delete},
-    extract::{State, Path, Json},
-    response::{IntoResponse, Response},
-    http::{header, HeaderMap, HeaderValue, StatusCode, Method},
+    extract::{State, Path, Json},   
+    http::{header, HeaderValue, Method},
     Extension,
     middleware
 };
@@ -14,7 +13,7 @@ use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
-use tower_http::cors::{CorsLayer, Any};
+use tower_http::cors::CorsLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use async_nats::Client as NatsClient;
@@ -27,37 +26,36 @@ use common::{
     Endpoint, 
     ConfigUpdate, 
     ConnectorDefinition, 
-    TriggerDefinition, 
-    Trigger,
+    TriggerDefinition,   
     RateLimitEvent,
     JwtClaims,
 };
 
 
+mod state;
+mod error;
 mod crypto;
 mod keycloak;
 mod rbac;
 mod transformers;
+mod handlers;
+use error::AppError;
 use crypto::CryptoService;
 use keycloak::KeycloakConfig;
 use rbac::{permission_middleware, rbac_middleware};
+use handlers::flow::{list_flows, 
+    test_flow, 
+    get_flow, 
+    create_flow, 
+    delete_flow, 
+    update_flow,
+    publish_event
+};
+use state::AppState;
 
-type RedisConnection = redis::aio::ConnectionManager;
 
-struct AppState {
-    db: PgPool,
-    nats: NatsClient,
-    redis: RedisConnection,
-    apis:             Arc<RwLock<Vec<ApiDefinition>>>,
-    flows:            Arc<RwLock<Vec<FlowDefinition>>>,
-    connectors:       Arc<RwLock<Vec<ConnectorDefinition>>>,
-    triggers:         Arc<RwLock<Vec<TriggerDefinition>>>,
-    connector_instances: Arc<RwLock<Vec<common::ConnectorInstance>>>,
-    rate_limit_stats: Arc<RwLock<HashMap<String, Vec<RateLimitEvent>>>>,
-    jwt_secret:       String,
-    crypto:           Arc<CryptoService>,
-    keycloak:         Arc<KeycloakConfig>,
-}
+//type RedisConnection = redis::aio::ConnectionManager;
+
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -132,6 +130,7 @@ async fn main() -> Result<()> {
     });
 
     load_flows_from_database(state.clone()).await?;
+    load_apis_from_database(state.clone()).await?;
     load_connector_instances(&state).await?;
     initialize_builtin_registry(state.clone()).await?;
 
@@ -177,6 +176,8 @@ async fn main() -> Result<()> {
     .allow_methods([
         Method::GET,
         Method::POST,
+        Method::PUT,
+        Method::DELETE,
         Method::OPTIONS, // 🔥 REQUIRED
     ])
     // 🔥 FIX: Replace 'Any' with an explicit list
@@ -197,6 +198,8 @@ async fn main() -> Result<()> {
         // Flow routes
         .route("/flows", get(list_flows).post(create_flow))
         .route("/flows/:id", get(get_flow).put(update_flow).delete(delete_flow))
+        .route("/flows/test", post(test_flow))
+        //Transformers
         .route("/transformers",     get(transformers::list_transformers))
         .route("/transformers/:id", get(transformers::get_transformer))
         .route("/transformers/capabilities", get(transformers::get_transformer_capabilities))
@@ -215,7 +218,7 @@ async fn main() -> Result<()> {
         .route("/auth/token",             post(issue_token))
          // ── Connector Instances ────────────────────────────────────────────
         .route("/connector-instances",     post(create_connector_instance).get(list_connector_instances))
-        .route("/connector-instances/:id", get(get_connector_instance).delete(delete_connector_instance))
+        .route("/connector-instances/:id", get(get_connector_instance).put(update_connector_instance).delete(delete_connector_instance))
         .route("/connector-instances/type/:connector_type", get(list_connector_instances_by_type))
           // ── User Management (RBAC) ─────────────────────────────────────────
         .route("/users/invite",       post(invite_user))
@@ -256,6 +259,27 @@ async fn load_flows_from_database(state: Arc<AppState>) -> Result<()> {
     }
     
     tracing::info!("✅ Loaded {} flows into memory", flows.len());
+    Ok(())
+}
+
+async fn load_apis_from_database(state: Arc<AppState>) -> Result<()> {
+    tracing::info!("📥 Loading API definitions from database into memory...");
+
+    let rows = sqlx::query("SELECT config FROM api_definitions")
+        .fetch_all(&state.db)
+        .await?;
+
+    let mut apis = state.apis.write().await;
+
+    for row in rows {
+        let config: serde_json::Value = row.try_get("config")?;
+        if let Ok(api) = serde_json::from_value::<ApiDefinition>(config) {
+            tracing::info!("  ➕ Loaded API: {} v{}", api.name, api.version);
+            apis.push(api);
+        }
+    }
+
+    tracing::info!("✅ Loaded {} API definitions into memory", apis.len());
     Ok(())
 }
 
@@ -320,11 +344,11 @@ async fn run_migrations(db: &PgPool) -> Result<()> {
         id                  VARCHAR(64)  PRIMARY KEY,
         name                VARCHAR(255) NOT NULL,
         connector_type      VARCHAR(100) NOT NULL,
-        host                VARCHAR(255) NOT NULL,
-        port                INTEGER      NOT NULL,
-        database_name       VARCHAR(255),
-        username            VARCHAR(255) NOT NULL,
-        password_encrypted  TEXT         NOT NULL,
+        host                VARCHAR(255) ,
+        port                INTEGER      ,
+        database_name       VARCHAR(255) ,
+        username            VARCHAR(255) ,
+        password_encrypted  TEXT         ,
         extra_attributes    JSONB        NOT NULL DEFAULT '{}',
         active              BOOLEAN      NOT NULL DEFAULT TRUE,
         created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
@@ -618,195 +642,6 @@ async fn get_api(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> 
     Ok(Json(json!(api)))
 }
 
-// Flow endpoints
-async fn list_flows(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let flows = state.flows.read().await;
-    Json(json!({"flows": *flows, "count": flows.len()}))
-}
-
-async fn create_flow(State(state): State<Arc<AppState>>, Json(flow): Json<FlowDefinition>) -> Result<Json<Value>, AppError> {
-    tracing::info!("📡 Creating flow: {}", flow.name);
-    
-    sqlx::query("INSERT INTO flow_definitions (name, config) VALUES ($1, $2)")
-        .bind(&flow.name)
-        .bind(serde_json::to_value(&flow).unwrap())
-        .execute(&state.db)
-        .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
-    let mut flows = state.flows.write().await;
-    flows.push(flow.clone());
-    drop(flows);
-    
-    // Auto-create or update API definition for HTTP triggers
-    if let Trigger::Http { path, method } = &flow.trigger {
-        auto_update_api_definition(&state, &flow, path, method).await?;
-    }
-    
-    let event = ConfigUpdate::FlowCreated { flow: flow.clone() };
-    publish_event(&state.nats, &event).await?;
-    
-    tracing::info!("✅ Flow created and API auto-updated: {}", flow.id);
-    Ok(Json(json!(flow)))
-}
-
-async fn update_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(flow): Json<FlowDefinition>) -> Result<Json<Value>, AppError> {
-    tracing::info!("🔄 Updating flow: {}", id);
-    
-    if flow.id != id {
-        return Err(AppError::Internal("Flow ID mismatch".to_string()));
-    }
-    
-    sqlx::query("UPDATE flow_definitions SET name = $1, config = $2 WHERE id = $3")
-        .bind(&flow.name)
-        .bind(serde_json::to_value(&flow).unwrap())
-        .bind(uuid::Uuid::parse_str(&id).unwrap())
-        .execute(&state.db)
-        .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
-    let mut flows = state.flows.write().await;
-    if let Some(existing) = flows.iter_mut().find(|f| f.id == id) {
-        *existing = flow.clone();
-    }
-    drop(flows);
-    
-    // Auto-update API definition
-    if let Trigger::Http { path, method } = &flow.trigger {
-        auto_update_api_definition(&state, &flow, path, method).await?;
-    }
-    
-    let event = ConfigUpdate::FlowUpdated { flow: flow.clone() };
-    publish_event(&state.nats, &event).await?;
-    
-    tracing::info!("✅ Flow updated and API auto-updated: {}", id);
-    Ok(Json(json!(flow)))
-}
-
-async fn get_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
-    let flows = state.flows.read().await;
-    let flow = flows.iter().find(|f| f.id == id).ok_or_else(|| AppError::NotFound("Flow not found".to_string()))?;
-    Ok(Json(json!(flow)))
-}
-
-async fn delete_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
-    tracing::info!("🗑️  Deleting flow: {}", id);
-    
-    // Get flow before deleting to update API
-    let flow = {
-        let flows = state.flows.read().await;
-        flows.iter().find(|f| f.id == id).cloned()
-    };
-    
-    sqlx::query("DELETE FROM flow_definitions WHERE id = $1")
-        .bind(uuid::Uuid::parse_str(&id).unwrap())
-        .execute(&state.db)
-        .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
-    let mut flows = state.flows.write().await;
-    flows.retain(|f| f.id != id);
-    drop(flows);
-    
-    // Remove from API definition
-    if let Some(flow) = flow {
-        if let Trigger::Http { path, .. } = &flow.trigger {
-            remove_from_api_definition(&state, &id, path).await?;
-        }
-    }
-    
-    let event = ConfigUpdate::FlowDeleted { flow_id: id.clone() };
-    publish_event(&state.nats, &event).await?;
-    
-    tracing::info!("✅ Flow deleted and API updated: {}", id);
-    Ok(Json(json!({"deleted": true, "flow_id": id})))
-}
-
-// Auto-update API definition when flow changes
-async fn auto_update_api_definition(state: &AppState, flow: &FlowDefinition, path: &str, method: &str) -> Result<(), AppError> {
-    tracing::info!("🔄 Auto-updating API definition for flow: {}", flow.id);
-    
-    let api_name = flow.name.clone();
-    let api_version = "1.0";
-    
-    let mut apis = state.apis.write().await;
-    
-    // Find or create auto-generated API
-    if let Some(api) = apis.iter_mut().find(|a| a.name == api_name && a.version == api_version) {
-        // Update existing endpoint or add new
-        if let Some(endpoint) = api.endpoints.iter_mut().find(|e| e.path == path && e.method == method) {
-            endpoint.flow_id = flow.id.clone();
-        } else {
-            api.endpoints.push(Endpoint {
-                path: path.to_string(),
-                method: method.to_string(),
-                flow_id: flow.id.clone(),
-            });
-        }
-        
-        // Save to DB
-        sqlx::query("UPDATE api_definitions SET config = $1 WHERE id = $2")
-            .bind(serde_json::to_value(&*api).unwrap())
-            .bind(uuid::Uuid::parse_str(&api.id).unwrap())
-            .execute(&state.db)
-            .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-        
-        tracing::info!("✅ Updated existing API definition");
-    } else {
-        // Create new auto-generated API
-        let api_id = uuid::Uuid::new_v4().to_string();
-        let new_api = ApiDefinition {
-            id: api_id.clone(),
-            name: api_name.to_string(),
-            version: api_version.to_string(),
-            base_path: "/api".to_string(),
-            endpoints: vec![Endpoint {
-                path: path.to_string(),
-                method: method.to_string(),
-                flow_id: flow.id.clone(),
-            }],
-        };
-
-        tracing::info!("api_definitions id {}", uuid::Uuid::parse_str(&new_api.id).unwrap());
-        
-        sqlx::query("INSERT INTO api_definitions (id, name, version, base_path, config) VALUES ($1, $2, $3, $4, $5)")
-            .bind(uuid::Uuid::parse_str(&new_api.id).unwrap())
-            .bind(&new_api.name)
-            .bind(&new_api.version)
-            .bind(&new_api.base_path)
-            .bind(serde_json::to_value(&new_api).unwrap())
-            .execute(&state.db)
-            .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-        
-        apis.push(new_api.clone());
-        
-        tracing::info!("✅ Created new API definition");
-    }
-    
-    Ok(())
-}
-
-async fn remove_from_api_definition(state: &AppState, flow_id: &str, path: &str) -> Result<(), AppError> {
-    let mut apis = state.apis.write().await;
-    
-    for api in apis.iter_mut() {
-        api.endpoints.retain(|e| e.flow_id != flow_id);
-        
-        // Update in DB
-        sqlx::query("UPDATE api_definitions SET config = $1 WHERE id = $2")
-            .bind(serde_json::to_value(&*api).unwrap())
-            .bind(uuid::Uuid::parse_str(&api.id).unwrap())
-            .execute(&state.db)
-            .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    }
-    
-    Ok(())
-}
-
-async fn publish_event(nats: &NatsClient, event: &ConfigUpdate) -> Result<(), AppError> {
-    let subject = event.subject();
-    let payload = serde_json::to_vec(event).map_err(|e| AppError::Internal(format!("Serialization error: {}", e)))?;
-    nats.publish(subject, payload.into()).await.map_err(|e| AppError::Internal(format!("NATS publish error: {}", e)))?;
-    tracing::debug!("📤 Published event to {}", subject);
-    Ok(())
-}
 
 // ─── Connector Instance Sync Service ─────────────────────────────────────────
 
@@ -962,34 +797,6 @@ async fn get_flow_rate_limit_stats(
     })))
 }
 
-// ─── Error type ──────────────────────────────────────────────────────────────
-enum AppError {
-    NotFound(String),
-    Internal(String),
-    Unauthorized(String),
-}
-
-impl IntoResponse for AppError {
-    fn into_response(self) -> Response {
-        let (status, message) = match self {
-            AppError::NotFound(msg) => (StatusCode::NOT_FOUND, msg),
-            AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg),
-            AppError::Unauthorized(m) => (StatusCode::UNAUTHORIZED, m),
-        };
-        (status, Json(json!({"error": message}))).into_response()
-    }
-}
-
-
-impl std::fmt::Display for AppError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AppError::Internal(msg) => write!(f, "{msg}"),
-            AppError::NotFound(msg) =>  write!(f, "{msg}"),
-            AppError::Unauthorized(msg) => write!(f, "{msg}"),
-        }
-    }
-}
 
 // ─── Credential validation service (NATS request-reply) ──────────────────────
 
@@ -1240,11 +1047,11 @@ struct CreateConnectorInstanceBody {
     id:               Option<String>,
     name:             String,
     connector_type:   String,
-    host:             String,
-    port:             u16,
-    database:         Option<String>,
-    username:         String,
-    password:         String,  // plain — will be encrypted
+    host:             Option<String>,
+    port:             Option<u16>,
+    database_name:    Option<String>,
+    username:         Option<String>,
+    password:         Option<String>,  // plain — will be encrypted
     extra_attributes: Option<serde_json::Value>,
 }
 
@@ -1254,9 +1061,13 @@ async fn create_connector_instance(
     Json(body): Json<CreateConnectorInstanceBody>,
 ) -> Result<Json<Value>, AppError> {
     let id = body.id.unwrap_or_else(|| format!("conn_{}", uuid::Uuid::new_v4().simple()));
-
-    let password_encrypted = state.crypto.encrypt(&body.password)
-        .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
+    
+  
+    let password_encrypted: Option<String> = match body.password.as_deref() {
+        Some(pwd) => Some(state.crypto.encrypt(pwd)
+            .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?),
+        None => None,
+    };
 
     let extra = body.extra_attributes.unwrap_or(json!({}));
 
@@ -1264,8 +1075,8 @@ async fn create_connector_instance(
         "INSERT INTO connector_instances
          (id, name, connector_type, host, port, database_name, username, password_encrypted, extra_attributes, active)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)",
-        id, body.name, body.connector_type, body.host, body.port as i32,
-        body.database, body.username, password_encrypted, extra
+        id, body.name, body.connector_type, body.host, body.port.map(|p| p as i32),
+        body.database_name, body.username, password_encrypted, extra
     )
     .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
@@ -1275,7 +1086,7 @@ async fn create_connector_instance(
         connector_type:      body.connector_type.clone(),
         host:                body.host.clone(),
         port:                body.port,
-        database:            body.database.clone(),
+        database:            body.database_name.clone(),
         username:            body.username.clone(),
         password_encrypted:  password_encrypted.clone(),
         extra_attributes:    extra.clone(),
@@ -1314,6 +1125,7 @@ async fn list_connector_instances(
         "database":       c.database,
         "username":       c.username,
         "active":         c.active,
+        "extra_attributes": c.extra_attributes,
         "created_at":     c.created_at,
         // password_encrypted intentionally omitted
     })).collect();
@@ -1340,6 +1152,7 @@ async fn get_connector_instance(
         "database":       instance.database,
         "username":       instance.username,
         "active":         instance.active,
+        "extra_attributes": instance.extra_attributes,
         "created_at":     instance.created_at,
     })))
     
@@ -1383,6 +1196,120 @@ async fn delete_connector_instance(
     Ok(Json(json!({ "deleted": id })))
 }
 
+/// PUT /connector-instances/:id
+async fn update_connector_instance(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(payload): Json<Value>,
+) -> Result<Json<Value>, AppError> {
+    // Extract fields from payload
+    let name = payload["name"].as_str()
+        .ok_or_else(|| AppError::BadRequest("Missing 'name' field".to_string()))?;
+    let connector_type = payload["connector_type"].as_str()
+        .ok_or_else(|| AppError::BadRequest("Missing 'connector_type' field".to_string()))?;
+    let host = payload["host"].as_str();
+    let port = payload["port"].as_i64().map(|p| p as i32);
+    let database = payload["database_name"].as_str();
+    let username = payload["username"].as_str();
+    let password = payload["password"].as_str();
+    let active = payload["active"].as_bool().unwrap_or(true);
+    
+    // Extract extra_attributes if provided
+    let extra_attributes = payload.get("extra_attributes").cloned();
+    
+    // Update in-memory storage
+    let mut instances = state.connector_instances.write().await;
+    let instance = instances.iter_mut().find(|c| c.id == id)
+        .ok_or_else(|| AppError::NotFound(format!("Connector instance not found: {}", id)))?;
+    
+    // Update fields
+    instance.name = name.to_string();
+    instance.connector_type = connector_type.to_string();
+    instance.host = host.map(|s| s.to_string());
+    instance.port = port.map(|p| p as u16);
+    instance.database = database.map(|s| s.to_string());
+    instance.username = username.map(|s| s.to_string());
+    instance.active = active;
+    
+    // Update extra_attributes if provided
+    if let Some(attrs) = &extra_attributes {
+        instance.extra_attributes = attrs.clone();
+    }
+    
+    // Encrypt password if provided
+    if let Some(pwd) = password {
+        let encrypted = state.crypto.encrypt(pwd)
+            .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
+        instance.password_encrypted = Some(encrypted);
+    }
+    
+    let updated = instance.clone();
+    drop(instances);
+    
+    // Convert extra_attributes to sqlx::types::Json for database
+    let extra_attrs_json = extra_attributes.as_ref()
+        .map(|v| sqlx::types::Json(v.clone()));
+    
+    // Update in database
+    sqlx::query!(
+        r#"
+        UPDATE connector_instances
+        SET name = $1, connector_type = $2, host = $3, port = $4,
+            database_name = $5, username = $6, password_encrypted = $7, active = $8,
+            extra_attributes = $9
+        WHERE id = $10
+        "#,
+        updated.name,
+        updated.connector_type,
+        updated.host,
+        updated.port.map(|p| p as i32),
+        updated.database,
+        updated.username,
+        updated.password_encrypted,
+        updated.active,
+        extra_attrs_json as Option<sqlx::types::Json<Value>>,
+        id
+    )
+    .execute(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(e.to_string()))?;
+    
+    // Publish update event to NATS
+    let event = json!({
+        "event": "connector_instance_updated",
+        "instance": {
+            "id": updated.id,
+            "name": updated.name,
+            "connector_type": updated.connector_type,
+            "host": updated.host,
+            "port": updated.port,
+            "database": updated.database,
+            "username": updated.username,
+            "active": updated.active,
+            "extra_attributes": updated.extra_attributes,
+        }
+    });
+    
+    if let Err(e) = state.nats.publish("connector.updated", event.to_string().into()).await {
+        tracing::warn!("Failed to publish connector update event: {}", e);
+    }
+    
+    tracing::info!("✏️ Updated connector instance: {}", updated.name);
+    
+    Ok(Json(json!({
+        "id": updated.id,
+        "name": updated.name,
+        "connector_type": updated.connector_type,
+        "host": updated.host,
+        "port": updated.port,
+        "database": updated.database,
+        "username": updated.username,
+        "active": updated.active,
+        "extra_attributes": updated.extra_attributes,
+        "created_at": updated.created_at,
+    })))
+}
+
 async fn publish_connector_instance_event(
     nats: &NatsClient,
     event: &common::ConnectorInstanceEvent,
@@ -1411,7 +1338,7 @@ async fn load_connector_instances(state: &AppState) -> Result<()> {
             name:               row.name,
             connector_type:     row.connector_type,
             host:               row.host,
-            port:               row.port as u16,
+            port:               row.port.map(|p| p as u16),
             database:           row.database_name,
             username:           row.username,
             password_encrypted: row.password_encrypted,

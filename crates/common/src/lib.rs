@@ -300,6 +300,23 @@ pub enum FlowStep {
         name: String,
         spec: serde_json::Value
     },
+    Loop {
+        name: String,
+        loop_mode: String,  // "while", "foreach", or "count"
+        
+        #[serde(skip_serializing_if = "Option::is_none")]
+        condition: Option<String>,
+        
+        #[serde(skip_serializing_if = "Option::is_none")]
+        iterate_over: Option<String>,
+        
+        #[serde(skip_serializing_if = "Option::is_none")]
+        count: Option<usize>,
+        
+        steps: Vec<FlowStep>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+           max_iterations: Option<usize>,
+    },
 }
 
 /// API Definition
@@ -357,11 +374,11 @@ pub struct ConnectorInstance {
     pub id:              String,           // e.g., "postgres_prod"
     pub name:            String,           // Human-readable: "Production DB"
     pub connector_type:  String,           // "postgres", "http", etc.
-    pub host:            String,
-    pub port:            u16,
+    pub host:            Option<String>,
+    pub port:            Option<u16>,
     pub database:        Option<String>,   // for DB connectors
-    pub username:        String,
-    pub password_encrypted: String,        // AES-256 encrypted
+    pub username:        Option<String>,
+    pub password_encrypted: Option<String>,        // AES-256 encrypted
     pub extra_attributes: serde_json::Value, // JSON for any connector-specific config
     pub active:          bool,
     pub created_at:      chrono::DateTime<chrono::Utc>,

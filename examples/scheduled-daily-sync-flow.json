@@ -1,0 +1,100 @@
+{
+  "id": "daily-user-sync",
+  "name": "Daily User Synchronization",
+  "description": "Syncs users from external API to database every day at 3 AM UTC",
+  "trigger": {
+    "type": "schedule",
+    "cron": "0 3 * * *",
+    "timezone": "UTC",
+    "description": "Every day at 3:00 AM UTC"
+  },
+  "steps": [
+    {
+      "type": "log",
+      "name": "start_log",
+      "message": "Starting daily user sync at {{trigger.scheduled_time}}"
+    },
+    {
+      "type": "set_variable",
+      "name": "init_vars",
+      "variables": {
+        "cursor": null,
+        "total_synced": 0,
+        "pages_processed": 0
+      }
+    },
+    {
+      "type": "loop",
+      "name": "pagination_loop",
+      "loop_mode": "while",
+      "condition": "cursor != 'EOF'",
+      "max_iterations": 100,
+      "steps": [
+        {
+          "type": "call",
+          "name": "fetch_users",
+          "connector": "external-api",
+          "operation": "get",
+          "params": {
+            "url": "https://api.example.com/users",
+            "query_params": {
+              "cursor": "{{cursor}}",
+              "limit": 100
+            }
+          }
+        },
+        {
+          "type": "log",
+          "name": "page_log",
+          "message": "Fetched {{fetch_users.data.length}} users (page {{iteration}})"
+        },
+        {
+          "type": "loop",
+          "name": "process_users",
+          "loop_mode": "foreach",
+          "iterate_over": "{{fetch_users.data}}",
+          "steps": [
+            {
+              "type": "call",
+              "name": "upsert_user",
+              "connector": "postgres",
+              "operation": "execute",
+              "params": {
+                "sql": "INSERT INTO users (id, name, email, last_synced) VALUES ($1, $2, $3, NOW()) ON CONFLICT (id) DO UPDATE SET name = $2, email = $3, last_synced = NOW()",
+                "params": [
+                  "{{item.id}}",
+                  "{{item.name}}",
+                  "{{item.email}}"
+                ]
+              }
+            }
+          ]
+        },
+        {
+          "type": "set_variable",
+          "name": "update_vars",
+          "variables": {
+            "cursor": "{{fetch_users.next_cursor || 'EOF'}}",
+            "total_synced": "{{total_synced + fetch_users.data.length}}",
+            "pages_processed": "{{pages_processed + 1}}"
+          }
+        }
+      ]
+    },
+    {
+      "type": "log",
+      "name": "completion_log",
+      "message": "✅ Daily sync completed: {{total_synced}} users synced in {{pages_processed}} pages"
+    },
+    {
+      "type": "call",
+      "name": "send_notification",
+      "connector": "slack",
+      "operation": "send_message",
+      "params": {
+        "channel": "#data-sync",
+        "message": "Daily user sync completed successfully. Synced {{total_synced}} users at {{trigger.scheduled_time}}"
+      }
+    }
+  ]
+}
