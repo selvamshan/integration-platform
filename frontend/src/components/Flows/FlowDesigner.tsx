@@ -555,6 +555,32 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
     })
   }
 
+  const isScheduleFlow = useCallback(() => {
+    const triggerNode = nodes.find((n) => n.data.type === 'trigger')
+    const triggerType =
+      triggerNode?.data.definition?.trigger_type ||
+      (triggerNode?.data.properties?.cron ? 'schedule' : 'http')
+    return triggerType === 'schedule'
+  }, [nodes])
+
+  const handleOpenTestDialog = () => {
+    if (isScheduleFlow()) {
+      const flow = buildFlow()
+      const now = new Date().toISOString()
+      const scheduleContext = {
+        type: 'schedule',
+        scheduled_time: now,
+        execution_time: now,
+        flow_id: flow.id,
+        flow_name: flow.name,
+      }
+      setTestInput(JSON.stringify(scheduleContext, null, 2))
+    } else {
+      setTestInput('')
+    }
+    setShowTestInput(true)
+  }
+
   const handleTest = async () => {
     setShowTestInput(false)
     const flow = buildFlow()
@@ -651,7 +677,7 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
               <Eye className="w-3.5 h-3.5" />
               View YAML
             </button>
-            <button onClick={() => setShowTestInput(true)} disabled={testing} className="btn btn-secondary flex items-center gap-1.5 text-sm h-8">
+            <button onClick={handleOpenTestDialog} disabled={testing} className="btn btn-secondary flex items-center gap-1.5 text-sm h-8">
               <Play className="w-3.5 h-3.5" />
               {testing ? 'Testing…' : 'Test'}
             </button>
@@ -740,14 +766,16 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
           onClick={(e) => e.stopPropagation()}
         >
           <div className="flex items-center justify-between px-5 py-4 border-b">
-            <h2 className="font-bold text-base">Test Flow</h2>
+            <h2 className="font-bold text-base">{isScheduleFlow() ? 'Run Scheduled Flow' : 'Test Flow'}</h2>
             <button onClick={() => setShowTestInput(false)} className="hover:bg-gray-100 p-1.5 rounded">
               <X className="w-4 h-4" />
             </button>
           </div>
           <div className="p-5 space-y-3">
             <label className="text-sm font-medium text-gray-700">
-              Test Input <span className="text-gray-400 font-normal">(JSON, optional)</span>
+              {isScheduleFlow()
+                ? <>Trigger Context <span className="text-gray-400 font-normal">(auto-filled from schedule trigger)</span></>
+                : <>Test Input <span className="text-gray-400 font-normal">(JSON, optional)</span></>}
             </label>
             <textarea
               value={testInput}

@@ -91,6 +91,10 @@ pub fn extract_permission(path: &str, method: &str) -> Option<Permission> {
         ("POST", "/users/invite") => Some(Permission::InviteUsers),
         ("DELETE", p) if p.starts_with("/users/") => Some(Permission::ManageUsers),
         
+        // Audit log permissions
+        ("GET", "/audit-logs") => Some(Permission::ReadAuditLogs),
+        ("GET", p) if p.ends_with("/audit-logs") => Some(Permission::ReadAuditLogs),
+
         // Public endpoints (no permission required)
         ("GET", "/health") => None,
         ("POST", "/auth/token") => None,  // Token issuance is public

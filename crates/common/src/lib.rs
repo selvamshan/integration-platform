@@ -454,6 +454,7 @@ impl UserRole {
             (UserRole::Developer, Permission::DeleteApis) => true,
             (UserRole::Developer, Permission::ReadMetrics) => true,
             (UserRole::Developer, Permission::ReadRateLimits) => true,
+            (UserRole::Developer, Permission::ReadAuditLogs) => true,
             
             // Viewer permissions (read-only)
             (UserRole::Viewer, Permission::ReadFlows) => true,
@@ -499,6 +500,9 @@ pub enum Permission {
     // User management (admin only)
     ManageUsers,
     InviteUsers,
+
+    // Audit log permissions
+    ReadAuditLogs,
 }
 
 /// User principal with Keycloak information

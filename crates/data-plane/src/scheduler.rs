@@ -73,12 +73,20 @@ impl FlowScheduler {
             tracing::debug!("Removed existing schedule for flow: {}", flow_id);
         }
 
+        // tokio_cron_scheduler requires a 6-field cron expression (sec min hour day month weekday).
+        // Convert standard 5-field expressions by prepending "0 " for seconds.
+        let cron_6field: String = if cron_expr.split_whitespace().count() == 5 {
+            format!("0 {}", cron_expr)
+        } else {
+            cron_expr.to_string()
+        };
+
         let flow_id_clone = flow_id.clone();
         let flow_name_clone = flow_name.clone();
         let jobs = self.jobs.clone();
 
         // Create new scheduled job
-        let job = Job::new_async(cron_expr, move |_uuid, _lock| {
+        let job = Job::new_async(cron_6field.as_str(), move |_uuid, _lock| {
             let flow_id = flow_id_clone.clone();
             let flow_name = flow_name_clone.clone();
             let executor = executor.clone();

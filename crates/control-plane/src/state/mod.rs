@@ -13,6 +13,7 @@ use common::{
 };
 use crate::crypto::CryptoService;
 use crate::keycloak::KeycloakConfig;
+use crate::audit::AuditLogger;
 
 type RedisConnection = redis::aio::ConnectionManager;
 
@@ -29,4 +30,5 @@ pub struct AppState {
     pub jwt_secret:       String,
     pub crypto:           Arc<CryptoService>,
     pub keycloak:         Arc<KeycloakConfig>,
+    pub audit_logger:     Arc<AuditLogger>
 }

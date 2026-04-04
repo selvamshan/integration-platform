@@ -39,10 +39,13 @@ mod keycloak;
 mod rbac;
 mod transformers;
 mod handlers;
+mod audit;
+mod db_migrations;
 use error::AppError;
 use crypto::CryptoService;
 use keycloak::KeycloakConfig;
 use rbac::{permission_middleware, rbac_middleware};
+use audit::AuditLogger;
 use handlers::flow::{list_flows, 
     test_flow, 
     get_flow, 
@@ -52,6 +55,7 @@ use handlers::flow::{list_flows,
     publish_event
 };
 use state::AppState;
+use db_migrations::run_migrations;
 
 
 //type RedisConnection = redis::aio::ConnectionManager;
@@ -127,6 +131,7 @@ async fn main() -> Result<()> {
         jwt_secret,
         crypto,
         keycloak: keycloak.clone(),
+        audit_logger: Arc::new(AuditLogger::new(db.clone())),
     });
 
     load_flows_from_database(state.clone()).await?;
@@ -225,6 +230,10 @@ async fn main() -> Result<()> {
         .route("/users",              get(list_users))
         .route("/users/me",           get(get_current_user))
         .route("/users/:user_id",     delete(delete_user))
+        // ── Audit Logs ────────────────────────────────────────────────────
+        .route("/audit-logs",                         get(handlers::audit::list_audit_logs))
+        .route("/flows/:id/audit-logs",               get(handlers::audit::get_flow_audit_logs))
+        .route("/connector-instances/:id/audit-logs", get(handlers::audit::get_connector_audit_logs))
         // ── RBAC Middleware (comment out to disable) ──────────────────────
         // Uncomment these lines to enable Keycloak-based RBAC:
         .layer(middleware::from_fn(permission_middleware))
@@ -321,65 +330,6 @@ async fn flow_sync_service(state: Arc<AppState>) -> Result<()> {
     Ok(())
 }
 
-async fn run_migrations(db: &PgPool) -> Result<()> {
-    tracing::info!("Running database migrations...");
-    
-    sqlx::query("CREATE TABLE IF NOT EXISTS users (id SERIAL PRIMARY KEY, name VARCHAR(255) NOT NULL, email VARCHAR(255) NOT NULL UNIQUE, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS api_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL, version VARCHAR(50) NOT NULL, base_path VARCHAR(255) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, UNIQUE(name, version))").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS flow_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS connector_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL UNIQUE, connector_type VARCHAR(100) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
-    sqlx::query("CREATE TABLE IF NOT EXISTS trigger_definitions (id UUID PRIMARY KEY DEFAULT gen_random_uuid(), name VARCHAR(255) NOT NULL UNIQUE, trigger_type VARCHAR(100) NOT NULL, config JSONB NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP)").execute(db).await?;
-     // ── Auth table ────────────────────────────────────────────────────────────
-    sqlx::query("CREATE TABLE IF NOT EXISTS client_credentials (
-        client_id          VARCHAR(64)  PRIMARY KEY,
-        client_secret_hash TEXT         NOT NULL,
-        name               VARCHAR(255) NOT NULL,
-        active             BOOLEAN      NOT NULL DEFAULT TRUE,
-        created_at         TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        expires_at         TIMESTAMPTZ
-    )").execute(db).await?;
-
-    // ── Connector instances table ─────────────────────────────────────────────
-    sqlx::query("CREATE TABLE IF NOT EXISTS connector_instances (
-        id                  VARCHAR(64)  PRIMARY KEY,
-        name                VARCHAR(255) NOT NULL,
-        connector_type      VARCHAR(100) NOT NULL,
-        host                VARCHAR(255) ,
-        port                INTEGER      ,
-        database_name       VARCHAR(255) ,
-        username            VARCHAR(255) ,
-        password_encrypted  TEXT         ,
-        extra_attributes    JSONB        NOT NULL DEFAULT '{}',
-        active              BOOLEAN      NOT NULL DEFAULT TRUE,
-        created_at          TIMESTAMPTZ  NOT NULL DEFAULT NOW()
-    )").execute(db).await?;
-
-     // ── User invitations table ────────────────────────────────────────────────
-    sqlx::query("CREATE TABLE IF NOT EXISTS user_invitations (
-        id              VARCHAR(64)  PRIMARY KEY,
-        email           VARCHAR(255) NOT NULL,
-        role            VARCHAR(50)  NOT NULL,
-        invited_by      VARCHAR(64)  NOT NULL,
-        invited_at      TIMESTAMPTZ  NOT NULL DEFAULT NOW(),
-        expires_at      TIMESTAMPTZ  NOT NULL,
-        token           VARCHAR(64)  NOT NULL UNIQUE,
-        accepted        BOOLEAN      NOT NULL DEFAULT FALSE
-    )").execute(db).await?;
-
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_invitations_email 
-                 ON user_invitations(email)").execute(db).await?;
-    sqlx::query("CREATE INDEX IF NOT EXISTS idx_invitations_token 
-                 ON user_invitations(token)").execute(db).await?;
-
-    let count: (i64,) = sqlx::query_as("SELECT COUNT(*) FROM users").fetch_one(db).await?;
-    if count.0 == 0 {
-        sqlx::query("INSERT INTO users (name, email) VALUES ('Alice Johnson', 'alice@example.com'), ('Bob Smith', 'bob@example.com'), ('Charlie Brown', 'charlie@example.com'), ('Diana Prince', 'diana@example.com'), ('Eve Wilson', 'eve@example.com')").execute(db).await?;
-        tracing::info!("✅ Sample data inserted");
-    }
-    
-    tracing::info!("✅ Migrations completed");
-    Ok(())
-}
 
 async fn initialize_builtin_registry(state: Arc<AppState>) -> Result<()> {
     tracing::info!("📋 Initializing built-in connectors and triggers...");
