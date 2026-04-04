@@ -1,6 +1,6 @@
 import { useState, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { Pencil, Trash2 } from 'lucide-react'
+import { Pencil, Trash2, ScrollText } from 'lucide-react'
 import { flowService } from '@/services/flow'
 import { Flow } from '@/types/flow'
 
@@ -36,9 +36,20 @@ export function Flows() {
             <div>
               <h3 className="font-bold">{f.name}</h3>
               <p className="text-sm text-gray-500 font-mono">{f.id}</p>
-              <p className="text-sm text-gray-600 mt-0.5">{f.trigger.method} {f.trigger.path}</p>
+              <p className="text-sm text-gray-600 mt-0.5">
+                {f.trigger.type === 'http'
+                  ? `${f.trigger.method} ${f.trigger.path}`
+                  : `schedule: ${f.trigger.cron}`}
+              </p>
             </div>
             <div className="flex items-center gap-2">
+              <button
+                onClick={() => navigate(`/audit-logs?entity_type=flow&entity_id=${f.id}`)}
+                className="btn btn-secondary flex items-center gap-1.5 text-sm"
+              >
+                <ScrollText className="w-4 h-4" />
+                Logs
+              </button>
               <button
                 onClick={() => navigate(`/flows/${f.id}`)}
                 className="btn btn-secondary flex items-center gap-1.5 text-sm"

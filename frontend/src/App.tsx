@@ -4,6 +4,7 @@ import { Dashboard } from './pages/Dashboard'
 import { Flows } from './pages/Flows'
 import { FlowEditor } from './pages/FlowEditor'
 import { Connectors } from './pages/Connectors'
+import { AuditLogs } from './pages/AuditLogs'
 import { Layout } from './components/Layout/Layout'
 import { ProtectedRoute } from './components/Auth/ProtectedRoute'
 
@@ -18,6 +19,7 @@ function App() {
           <Route path="flows" element={<Flows />} />
           <Route path="flows/:id" element={<FlowEditor />} />
           <Route path="connectors" element={<Connectors />} />
+          <Route path="audit-logs" element={<AuditLogs />} />
         </Route>
       </Routes>
     </BrowserRouter>

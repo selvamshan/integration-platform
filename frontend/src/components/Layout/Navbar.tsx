@@ -12,6 +12,7 @@ export function Navbar() {
             <Link to="/dashboard" className="font-bold text-xl">Integration Platform</Link>
             <Link to="/flows" className="hover:text-primary-600">Flows</Link>
             <Link to="/connectors" className="hover:text-primary-600">Connectors</Link>
+            <Link to="/audit-logs" className="hover:text-primary-600">Audit Logs</Link>
           </div>
           <div className="flex items-center gap-4">
             <span>{user?.preferred_username}</span>

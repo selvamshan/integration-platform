@@ -1,3 +1,4 @@
+import { useNavigate } from 'react-router-dom'
 import { ConnectorInstance } from '@/types/connector'
 
 const TYPE_LABEL: Record<string, string> = {
@@ -11,6 +12,8 @@ export function ConnectorList({ connectors, onEdit, onDelete }: {
   onEdit: (connector: ConnectorInstance) => void
   onDelete: (id: string) => void
 }) {
+  const navigate = useNavigate()
+
   if (connectors.length === 0) {
     return (
       <div className="text-center py-16 text-gray-500">
@@ -43,6 +46,12 @@ export function ConnectorList({ connectors, onEdit, onDelete }: {
             <p className="text-xs text-gray-400 mt-0.5">ID: {c.id}</p>
           </div>
           <div className="flex gap-2">
+            <button
+              onClick={() => navigate(`/audit-logs?entity_type=connector_instance&entity_id=${c.id}`)}
+              className="btn btn-secondary text-sm"
+            >
+              Logs
+            </button>
             <button
               onClick={() => onEdit(c)}
               className="btn btn-secondary"
