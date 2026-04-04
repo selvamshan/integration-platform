@@ -105,6 +105,7 @@ impl AuditLogger {
         let action_str = serde_json::to_string(&action).unwrap();
         let status_str = serde_json::to_string(&status).unwrap();
 
+        let ip_address_str = ip_address.map(|ip| ip.to_string());
         sqlx::query!(
             r#"
             INSERT INTO audit_logs (
@@ -132,7 +133,7 @@ impl AuditLogger {
             user_id,
             user_email,
             user_role,
-            ip_address,
+            ip_address_str,
             user_agent,
             request_id,
             old_values,
@@ -231,7 +232,7 @@ impl AuditLogger {
                 id, entity_type, entity_id, entity_name,
                 action, status,
                 user_id, user_email, user_role,
-                ip_address, user_agent, request_id,
+                ip_address::TEXT as ip_address, user_agent, request_id,
                 old_values, new_values, changes, parameters,
                 error_message, duration_ms, created_at
             FROM audit_logs
@@ -256,7 +257,7 @@ impl AuditLogger {
             user_id: r.user_id,
             user_email: r.user_email,
             user_role: r.user_role,
-            ip_address: r.ip_address,
+            ip_address: r.ip_address.and_then(|s| s.parse().ok()),
             user_agent: r.user_agent,
             request_id: r.request_id,
             old_values: r.old_values,
@@ -265,7 +266,7 @@ impl AuditLogger {
             parameters: r.parameters,
             error_message: r.error_message,
             duration_ms: r.duration_ms,
-            created_at: r.created_at,
+            created_at: r.created_at.unwrap_or_else(Utc::now),
         }).collect())
     }
 
@@ -281,7 +282,7 @@ impl AuditLogger {
                 id, entity_type, entity_id, entity_name,
                 action, status,
                 user_id, user_email, user_role,
-                ip_address, user_agent, request_id,
+                ip_address::TEXT as ip_address, user_agent, request_id,
                 old_values, new_values, changes, parameters,
                 error_message, duration_ms, created_at
             FROM audit_logs
@@ -305,7 +306,7 @@ impl AuditLogger {
             user_id: r.user_id,
             user_email: r.user_email,
             user_role: r.user_role,
-            ip_address: r.ip_address,
+            ip_address: r.ip_address.and_then(|s| s.parse().ok()),
             user_agent: r.user_agent,
             request_id: r.request_id,
             old_values: r.old_values,
@@ -314,7 +315,7 @@ impl AuditLogger {
             parameters: r.parameters,
             error_message: r.error_message,
             duration_ms: r.duration_ms,
-            created_at: r.created_at,
+            created_at: r.created_at.unwrap_or_else(Utc::now),
         }).collect())
     }
 
@@ -329,7 +330,7 @@ impl AuditLogger {
                 id, entity_type, entity_id, entity_name,
                 action, status,
                 user_id, user_email, user_role,
-                ip_address, user_agent, request_id,
+                ip_address::TEXT as ip_address, user_agent, request_id,
                 old_values, new_values, changes, parameters,
                 error_message, duration_ms, created_at
             FROM audit_logs
@@ -351,7 +352,7 @@ impl AuditLogger {
             user_id: r.user_id,
             user_email: r.user_email,
             user_role: r.user_role,
-            ip_address: r.ip_address,
+            ip_address: r.ip_address.and_then(|s| s.parse().ok()),
             user_agent: r.user_agent,
             request_id: r.request_id,
             old_values: r.old_values,
@@ -360,7 +361,7 @@ impl AuditLogger {
             parameters: r.parameters,
             error_message: r.error_message,
             duration_ms: r.duration_ms,
-            created_at: r.created_at,
+            created_at: r.created_at.unwrap_or_else(Utc::now),
         }).collect())
     }
 }

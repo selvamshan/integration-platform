@@ -40,7 +40,7 @@ mod rbac;
 mod transformers;
 mod handlers;
 mod audit;
-mod db_migrations;
+//mod db_migrations;
 use error::AppError;
 use crypto::CryptoService;
 use keycloak::KeycloakConfig;
@@ -55,7 +55,7 @@ use handlers::flow::{list_flows,
     publish_event
 };
 use state::AppState;
-use db_migrations::run_migrations;
+//use db_migrations::run_migrations;
 
 
 //type RedisConnection = redis::aio::ConnectionManager;
@@ -116,7 +116,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    run_migrations(&db).await?;
+    //run_migrations(&db).await?;
     
     let state = Arc::new(AppState {
         db: db.clone(),

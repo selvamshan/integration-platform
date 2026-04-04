@@ -1,3 +1,4 @@
+use anyhow::Result;
 use sqlx::PgPool;
 
 
@@ -77,7 +78,7 @@ pub async fn run_migrations(db: &PgPool) -> Result<()> {
         error_message TEXT,
         duration_ms INTEGER,    
         -- Timestamp
-        created_at TIMESTAMPTZ DEFAULT NOW()
+        created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )" ).execute(db).await?;  
 
     //Create indexes for common queries
