@@ -82,21 +82,21 @@ pub async fn run_migrations(db: &PgPool) -> Result<()> {
     )" ).execute(db).await?;  
 
     //Create indexes for common queries
-    sqlx::query("CREATE INDEX idx_audit_entity ON audit_logs(entity_type, entity_id);")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_entity ON audit_logs(entity_type, entity_id)")
     .execute(db).await?;
-    sqlx::query("CREATE INDEX idx_audit_user ON audit_logs(user_id)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_user ON audit_logs(user_id)")
     .execute(db).await?;
-    sqlx::query("CREATE INDEX idx_audit_created ON audit_logs(created_at DESC)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at DESC)")
     .execute(db).await?;
-    sqlx::query("CREATE INDEX idx_audit_action ON audit_logs(action)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_action ON audit_logs(action)")
     .execute(db).await?;
-    sqlx::query("CREATE INDEX idx_audit_status ON audit_logs(status)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_status ON audit_logs(status)")
     .execute(db).await?;
-    sqlx::query("CREATE INDEX idx_audit_entity_created ON audit_logs(entity_type, entity_id, created_at DESC)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_entity_created ON audit_logs(entity_type, entity_id, created_at DESC)")
     .execute(db).await?;
 
     //Create composite index for common filter combinations
-    sqlx::query("CREATE INDEX idx_audit_entity_action ON audit_logs(entity_type, action, created_at DESC)")
+    sqlx::query("CREATE INDEX IF NOT EXISTS idx_audit_entity_action ON audit_logs(entity_type, action, created_at DESC)")
     .execute(db).await?;
 
     // Comment the table

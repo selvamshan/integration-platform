@@ -46,7 +46,36 @@ pub enum AuditAction {
 
 impl std::fmt::Display for AuditAction {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        let s = match self {
+            AuditAction::Create => "CREATE",
+            AuditAction::Update => "UPDATE",
+            AuditAction::Delete => "DELETE",
+            AuditAction::Execute => "EXECUTE",
+            AuditAction::Enable => "ENABLE",
+            AuditAction::Disable => "DISABLE",
+            AuditAction::Test => "TEST",
+            AuditAction::Schedule => "SCHEDULE",
+            AuditAction::Unschedule => "UNSCHEDULE",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl std::str::FromStr for AuditAction {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "CREATE" => Ok(AuditAction::Create),
+            "UPDATE" => Ok(AuditAction::Update),
+            "DELETE" => Ok(AuditAction::Delete),
+            "EXECUTE" => Ok(AuditAction::Execute),
+            "ENABLE" => Ok(AuditAction::Enable),
+            "DISABLE" => Ok(AuditAction::Disable),
+            "TEST" => Ok(AuditAction::Test),
+            "SCHEDULE" => Ok(AuditAction::Schedule),
+            "UNSCHEDULE" => Ok(AuditAction::Unschedule),
+            _ => Err(format!("Unknown action: {s}")),
+        }
     }
 }
 
@@ -59,7 +88,22 @@ pub enum AuditStatus {
 
 impl std::fmt::Display for AuditStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:?}", self)
+        let s = match self {
+            AuditStatus::Success => "SUCCESS",
+            AuditStatus::Failure => "FAILURE",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+impl std::str::FromStr for AuditStatus {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "SUCCESS" => Ok(AuditStatus::Success),
+            "FAILURE" => Ok(AuditStatus::Failure),
+            _ => Err(format!("Unknown status: {s}")),
+        }
     }
 }
 
@@ -102,8 +146,8 @@ impl AuditLogger {
         };
 
         let id = Uuid::new_v4();
-        let action_str = serde_json::to_string(&action).unwrap();
-        let status_str = serde_json::to_string(&status).unwrap();
+        let action_str = action.to_string();
+        let status_str = status.to_string();
 
         let ip_address_str = ip_address.map(|ip| ip.to_string());
         sqlx::query!(
@@ -119,7 +163,7 @@ impl AuditLogger {
                 $1, $2, $3, $4,
                 $5, $6,
                 $7, $8, $9,
-                $10, $11, $12,
+                $10::inet, $11, $12,
                 $13, $14, $15, $16,
                 $17, $18
             )
@@ -133,7 +177,7 @@ impl AuditLogger {
             user_id,
             user_email,
             user_role,
-            ip_address_str,
+            ip_address_str as Option<String>,
             user_agent,
             request_id,
             old_values,
@@ -247,27 +291,35 @@ impl AuditLogger {
         .fetch_all(&self.db)
         .await?;
 
-        Ok(records.into_iter().map(|r| AuditLog {
-            id: r.id,
-            entity_type: r.entity_type,
-            entity_id: r.entity_id,
-            entity_name: r.entity_name,
-            action: serde_json::from_str(&r.action).unwrap(),
-            status: serde_json::from_str(&r.status).unwrap(),
-            user_id: r.user_id,
-            user_email: r.user_email,
-            user_role: r.user_role,
-            ip_address: r.ip_address.and_then(|s| s.parse().ok()),
-            user_agent: r.user_agent,
-            request_id: r.request_id,
-            old_values: r.old_values,
-            new_values: r.new_values,
-            changes: r.changes,
-            parameters: r.parameters,
-            error_message: r.error_message,
-            duration_ms: r.duration_ms,
-            created_at: r.created_at.unwrap_or_else(Utc::now),
-        }).collect())
+        records.into_iter().map(|r| -> Result<AuditLog, sqlx::Error> {
+            Ok(AuditLog {
+                id: r.id,
+                entity_type: r.entity_type,
+                entity_id: r.entity_id,
+                entity_name: r.entity_name,
+                action: r.action.parse::<AuditAction>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    )))?,
+                status: r.status.parse::<AuditStatus>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    )))?,
+                user_id: r.user_id,
+                user_email: r.user_email,
+                user_role: r.user_role,
+                ip_address: r.ip_address.and_then(|s| s.parse().ok()),
+                user_agent: r.user_agent,
+                request_id: r.request_id,
+                old_values: r.old_values,
+                new_values: r.new_values,
+                changes: r.changes,
+                parameters: r.parameters,
+                error_message: r.error_message,
+                duration_ms: r.duration_ms,
+                created_at: r.created_at.unwrap_or_else(Utc::now),
+            })
+        }).collect()
     }
 
     /// Get audit logs for user
@@ -296,27 +348,35 @@ impl AuditLogger {
         .fetch_all(&self.db)
         .await?;
 
-        Ok(records.into_iter().map(|r| AuditLog {
-            id: r.id,
-            entity_type: r.entity_type,
-            entity_id: r.entity_id,
-            entity_name: r.entity_name,
-            action: serde_json::from_str(&r.action).unwrap(),
-            status: serde_json::from_str(&r.status).unwrap(),
-            user_id: r.user_id,
-            user_email: r.user_email,
-            user_role: r.user_role,
-            ip_address: r.ip_address.and_then(|s| s.parse().ok()),
-            user_agent: r.user_agent,
-            request_id: r.request_id,
-            old_values: r.old_values,
-            new_values: r.new_values,
-            changes: r.changes,
-            parameters: r.parameters,
-            error_message: r.error_message,
-            duration_ms: r.duration_ms,
-            created_at: r.created_at.unwrap_or_else(Utc::now),
-        }).collect())
+        records.into_iter().map(|r| -> Result<AuditLog, sqlx::Error> {
+            Ok(AuditLog {
+                id: r.id,
+                entity_type: r.entity_type,
+                entity_id: r.entity_id,
+                entity_name: r.entity_name,
+                action: r.action.parse::<AuditAction>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    )))?,
+                status: r.status.parse::<AuditStatus>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    )))?,
+                user_id: r.user_id,
+                user_email: r.user_email,
+                user_role: r.user_role,
+                ip_address: r.ip_address.and_then(|s| s.parse().ok()),
+                user_agent: r.user_agent,
+                request_id: r.request_id,
+                old_values: r.old_values,
+                new_values: r.new_values,
+                changes: r.changes,
+                parameters: r.parameters,
+                error_message: r.error_message,
+                duration_ms: r.duration_ms,
+                created_at: r.created_at.unwrap_or_else(Utc::now),
+            })
+        }).collect()
     }
 
     /// Get recent audit logs
@@ -342,27 +402,35 @@ impl AuditLogger {
         .fetch_all(&self.db)
         .await?;
 
-        Ok(records.into_iter().map(|r| AuditLog {
-            id: r.id,
-            entity_type: r.entity_type,
-            entity_id: r.entity_id,
-            entity_name: r.entity_name,
-            action: serde_json::from_str(&r.action).unwrap(),
-            status: serde_json::from_str(&r.status).unwrap(),
-            user_id: r.user_id,
-            user_email: r.user_email,
-            user_role: r.user_role,
-            ip_address: r.ip_address.and_then(|s| s.parse().ok()),
-            user_agent: r.user_agent,
-            request_id: r.request_id,
-            old_values: r.old_values,
-            new_values: r.new_values,
-            changes: r.changes,
-            parameters: r.parameters,
-            error_message: r.error_message,
-            duration_ms: r.duration_ms,
-            created_at: r.created_at.unwrap_or_else(Utc::now),
-        }).collect())
+        records.into_iter().map(|r| -> Result<AuditLog, sqlx::Error> {
+            Ok(AuditLog {
+                id: r.id,
+                entity_type: r.entity_type,
+                entity_id: r.entity_id,
+                entity_name: r.entity_name,
+                action: r.action.parse::<AuditAction>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    )))?,
+                status: r.status.parse::<AuditStatus>()
+                    .map_err(|e| sqlx::Error::Decode(Box::new(
+                        std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+                    )))?,
+                user_id: r.user_id,
+                user_email: r.user_email,
+                user_role: r.user_role,
+                ip_address: r.ip_address.and_then(|s| s.parse().ok()),
+                user_agent: r.user_agent,
+                request_id: r.request_id,
+                old_values: r.old_values,
+                new_values: r.new_values,
+                changes: r.changes,
+                parameters: r.parameters,
+                error_message: r.error_message,
+                duration_ms: r.duration_ms,
+                created_at: r.created_at.unwrap_or_else(Utc::now),
+            })
+        }).collect()
     }
 }
 

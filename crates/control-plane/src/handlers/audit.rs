@@ -41,9 +41,10 @@ pub async fn list_audit_logs(
         ).await.map_err(|e| AppError::Internal(e.to_string()))?
     };
 
+    let count = logs.len();
     Ok(Json(json!({
         "logs": logs,
-        "count": logs.len()
+        "count": count
     })))
 }
 
@@ -63,10 +64,11 @@ pub async fn get_flow_audit_logs(
         100,
     ).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let count = logs.len();
     Ok(Json(json!({
         "flow_id": id,
         "logs": logs,
-        "count": logs.len()
+        "count": count
     })))
 }
 
@@ -86,10 +88,11 @@ pub async fn get_connector_audit_logs(
         100,
     ).await.map_err(|e| AppError::Internal(e.to_string()))?;
 
+    let count = logs.len();
     Ok(Json(json!({
         "connector_id": id,
         "logs": logs,
-        "count": logs.len()
+        "count": count
     })))
 }
 

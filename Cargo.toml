@@ -21,7 +21,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "postgres", "uuid", "chrono", "ipnetwork"] }
 tower = "0.4"
-tower-http = { version = "0.5", features = ["trace", "cors"] }
+tower-http = { version = "0.5", features = ["trace", "cors", "catch-panic"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 async-trait = "0.1"
 chrono = { version = "0.4", features = ["serde"] }

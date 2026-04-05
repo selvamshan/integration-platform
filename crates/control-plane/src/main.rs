@@ -14,6 +14,7 @@ use std::collections::HashMap;
 use tokio::sync::RwLock;
 use tower_http::trace::TraceLayer;
 use tower_http::cors::CorsLayer;
+use tower_http::catch_panic::CatchPanicLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 use sqlx::{PgPool, postgres::PgPoolOptions, Row};
 use async_nats::Client as NatsClient;
@@ -40,7 +41,7 @@ mod rbac;
 mod transformers;
 mod handlers;
 mod audit;
-//mod db_migrations;
+mod db_migrations;
 use error::AppError;
 use crypto::CryptoService;
 use keycloak::KeycloakConfig;
@@ -55,7 +56,7 @@ use handlers::flow::{list_flows,
     publish_event
 };
 use state::AppState;
-//use db_migrations::run_migrations;
+use db_migrations::run_migrations;
 
 
 //type RedisConnection = redis::aio::ConnectionManager;
@@ -116,7 +117,7 @@ async fn main() -> Result<()> {
         }
     };
 
-    //run_migrations(&db).await?;
+    run_migrations(&db).await?;
     
     let state = Arc::new(AppState {
         db: db.clone(),
@@ -238,8 +239,9 @@ async fn main() -> Result<()> {
         // Uncomment these lines to enable Keycloak-based RBAC:
         .layer(middleware::from_fn(permission_middleware))
         .layer(middleware::from_fn_with_state(keycloak.clone(), rbac_middleware))
-        .layer(cors)        
+        .layer(cors)
         .layer(TraceLayer::new_for_http())
+        .layer(CatchPanicLayer::new())
         .with_state(state);
 
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], 8081));
