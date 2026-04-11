@@ -1,4 +1,4 @@
-version: '3.8'
+#version: '3.8'
 
 services:
   nats:
@@ -65,7 +65,7 @@ services:
       KEYCLOAK_SERVER_URL: http://keycloak:8080
       KEYCLOAK_REALM: integration-platform
       KEYCLOAK_CLIENT_ID: control-plane
-      KEYCLOAK_CLIENT_SECRET: "${KEYCLOAK_CLIENT_SECRET:-ss8OfTRBEqgHHTuRyMcw3Acafu2ON1T2}"
+      KEYCLOAK_CLIENT_SECRET: "${KEYCLOAK_CLIENT_SECRET:-i4j4w6pLHfyQWyMp9Cq5AZVGdsljE92h}"
     ports:
       - "8081:8081"
     depends_on:

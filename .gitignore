@@ -22,3 +22,7 @@ frontend/node_modules/
 
 # Logs
 *.log
+
+# md
+building_aid/
+
