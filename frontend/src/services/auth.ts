@@ -1,6 +1,6 @@
 import axios from 'axios'
 
-const KEYCLOAK_URL = import.meta.env.VITE_KEYCLOAK_URL || 'http://localhost:8180'
+const KEYCLOAK_URL = import.meta.env.VITE_KEYCLOAK_URL || '/keycloak'
 const REALM = import.meta.env.VITE_KEYCLOAK_REALM || 'integration-platform'
 const CLIENT_ID = import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'control-plane'
 const CLIENT_SECRET = import.meta.env.VITE_KEYCLOAK_CLIENT_SECRET || ''
