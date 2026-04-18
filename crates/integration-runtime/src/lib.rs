@@ -7,6 +7,7 @@ pub mod connectors;
 pub mod transformers;
 pub mod loop_executor;
 pub mod templates;
+pub mod graph_executor;
 
 pub use loop_executor::{LoopExecutor, LoopType};
 
@@ -31,10 +32,19 @@ impl FlowExecutor {
         self.connectors.insert(name, connector);
     }
 
-    /// Execute a flow
+    /// Execute a flow — dispatches to graph executor when nodes are present,
+    /// falls back to linear executor for legacy step-only flows.
     pub async fn execute_flow(&self, flow: &FlowDefinition, input: Message) -> Result<Message> {
         info!("🚀 Executing flow: {}", flow.name);
-        let result = self.execute_steps(&flow.steps, input).await?;
+        let result = if flow.is_graph_flow() {
+            info!("   mode: graph ({} nodes, {} edges)", flow.nodes.len(), flow.edges.len());
+            graph_executor::execute_graph(flow, input, |node, msg| {
+                self.execute_step(&node.step, msg)
+            }).await?
+        } else {
+            info!("   mode: linear ({} steps)", flow.steps.len());
+            self.execute_steps(&flow.steps, input).await?
+        };
         info!("✅ Flow completed: {}", flow.name);
         Ok(result)
     }
@@ -49,7 +59,7 @@ impl FlowExecutor {
     }
 
     /// Execute a single flow step.
-    async fn execute_step(&self, step: &FlowStep, mut current: Message) -> Result<Message> {
+    pub async fn execute_step(&self, step: &FlowStep, mut current: Message) -> Result<Message> {
         match step {
             FlowStep::Log { name, message } => {
                 let resolved = match resolve_template_str(message, &current.payload) {

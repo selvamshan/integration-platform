@@ -2,7 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { flowService, TestFlowResult } from '@/services/flow'
 import { connectorDefinitionService } from '@/services/connectorDefinitions'
 import { api } from '@/services/api'
-import type { Flow, FlowStep } from '@/types/flow'
+import type { Flow, FlowStep, EdgeCondition } from '@/types/flow'
 import ReactFlow, {
   Node,
   Edge,
@@ -291,35 +291,28 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
         },
       })
 
-      // Step nodes + edges from routing fields
       const stepIcons: Record<string, string> = { log: '📋', call: '🔌', transform: '⚙️' }
-      initialFlow.steps.forEach((step: FlowStep, i: number) => {
+
+      const buildStepNode = (step: FlowStep, id: string, pos: { x: number; y: number }): Node => {
         const visualType = step.type === 'call' ? 'connector' : step.type
         const color = colors[visualType as keyof typeof colors] ?? { bg: '#e5e7eb', border: '#6b7280' }
-
         const properties =
           step.type === 'call'
             ? { instance: step.connector, operation: step.operation, params: step.params }
             : step.type === 'transform'
             ? step.spec
             : { name: step.name, message: step.message }
-
-        // For connector nodes, resolve the full definition so NodePropertiesPanel
-        // can show connector_type, load instances, and populate the operations dropdown.
         let definition: any = {}
         if (step.type === 'call') {
           const connectorType = instanceTypeMap.get(step.connector ?? '')
-          if (connectorType) {
-            definition = connectorDefsMap.get(connectorType) ?? {}
-          }
+          if (connectorType) definition = connectorDefsMap.get(connectorType) ?? {}
         }
-
-        newNodes.push({
-          id: step.name,
+        return {
+          id,
           type: 'custom',
-          position: { x: 300, y: 200 + i * 150 },
+          position: pos,
           data: {
-            label: step.name,
+            label: id,
             icon: stepIcons[step.type] ?? '📦',
             type: visualType,
             bgColor: color.bg,
@@ -328,46 +321,67 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
             properties,
             onDelete: handleDeleteNode,
           },
-        })
+        }
+      }
 
-        if (step.next) {
+      if (initialFlow.nodes.length > 0) {
+        // ── Graph flow: restore from nodes + edges ──────────────────────────
+        for (const fn of initialFlow.nodes) {
+          newNodes.push(buildStepNode(fn.step, fn.id, {
+            x: fn.position_x ?? 300,
+            y: fn.position_y ?? 200,
+          }))
+        }
+        for (const fe of initialFlow.edges) {
           newEdges.push({
-            id: `${step.name}→${step.next}`,
-            source: step.name,
-            target: step.next,
+            id: fe.id,
+            source: fe.from,
+            target: fe.to,
             type: 'custom',
-            data: { condition: step.condition ? 'custom' : 'always', expression: step.condition },
+            data: {
+              condition: fe.condition === 'expression' ? 'custom' : fe.condition,
+              expression: fe.expression,
+            },
           })
         }
-        if (step.on_success) {
+        // Connect trigger → first root node (nodes with no incoming edges)
+        const targetIds = new Set(initialFlow.edges.map((e) => e.to))
+        const rootNodes = initialFlow.nodes.filter((n) => !targetIds.has(n.id))
+        for (const root of rootNodes) {
           newEdges.push({
-            id: `${step.name}→ok→${step.on_success}`,
-            source: step.name,
-            target: step.on_success,
+            id: `trigger_node→${root.id}`,
+            source: 'trigger_node',
+            target: root.id,
             type: 'custom',
-            data: { condition: 'on_success' },
+            data: { condition: 'always' },
           })
         }
-        if (step.on_error) {
-          newEdges.push({
-            id: `${step.name}→err→${step.on_error}`,
-            source: step.name,
-            target: step.on_error,
-            type: 'custom',
-            data: { condition: 'on_error' },
-          })
-        }
-      })
-
-      // Trigger → first step edge
-      if (initialFlow.steps.length > 0) {
-        newEdges.push({
-          id: `trigger_node→${initialFlow.steps[0].name}`,
-          source: 'trigger_node',
-          target: initialFlow.steps[0].name,
-          type: 'custom',
-          data: { condition: 'always' },
+      } else {
+        // ── Legacy linear flow: restore from steps ──────────────────────────
+        const steps = initialFlow.steps ?? []
+        steps.forEach((step: FlowStep, i: number) => {
+          newNodes.push(buildStepNode(step, step.name, { x: 300, y: 200 + i * 150 }))
         })
+        // Trigger → first step edge
+        if (steps.length > 0) {
+          newEdges.push({
+            id: `trigger_node→${steps[0].name}`,
+            source: 'trigger_node',
+            target: steps[0].name,
+            type: 'custom',
+            data: { condition: 'always' },
+          })
+          // Chain steps sequentially
+          for (let i = 0; i < steps.length - 1; i++) {
+            newEdges.push({
+              id: `${steps[i].name}→${steps[i + 1].name}`,
+              source: steps[i].name,
+              target: steps[i + 1].name,
+              type: 'custom',
+              data: { condition: 'always' },
+            })
+          }
+        }
       }
 
       // Rate limit node
@@ -390,8 +404,9 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
 
       // Advance nodeId counter past any existing node_N IDs to avoid collisions
       let maxId = 0
-      for (const step of initialFlow.steps) {
-        const m = step.name.match(/^node_(\d+)$/)
+      for (const n of initialFlow.nodes.length > 0 ? initialFlow.nodes : (initialFlow.steps ?? [])) {
+        const nameStr = 'id' in n ? (n as any).id : (n as FlowStep).name
+        const m = nameStr.match(/^node_(\d+)$/)
         if (m) maxId = Math.max(maxId, parseInt(m[1]) + 1)
       }
       nodeId = maxId
@@ -407,33 +422,8 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
   // ── Build flow object (shared by Save and View YAML) ─────────────────────
   const buildFlow = useCallback(() => {
     const triggerNode = nodes.find((n) => n.data.type === 'trigger')
-
-    const adjacency = new Map<string, { target: string; condition: string; expression?: string }[]>()
-    for (const edge of edges) {
-      const list = adjacency.get(edge.source) ?? []
-      list.push({
-        target: edge.target,
-        condition: edge.data?.condition ?? 'always',
-        expression: edge.data?.expression,
-      })
-      adjacency.set(edge.source, list)
-    }
-
-    const nodeMap = new Map(nodes.map((n) => [n.id, n]))
-    const ordered: Node[] = []
-    const visited = new Set<string>()
-
-    function dfs(id: string) {
-      if (visited.has(id)) return
-      visited.add(id)
-      ordered.push(nodeMap.get(id)!)
-      for (const { target } of adjacency.get(id) ?? []) dfs(target)
-    }
-
-    if (triggerNode) dfs(triggerNode.id)
-    for (const n of nodes) if (!visited.has(n.id)) ordered.push(n)
-
     const rateLimitNode = nodes.find((n) => n.data.type === 'rate_limit')
+
     const rateLimit = rateLimitNode
       ? {
           max_requests: Number(rateLimitNode.data.properties?.max_requests) || 10,
@@ -444,51 +434,6 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
             : {}),
         }
       : undefined
-
-    const steps = ordered
-      .filter((n) => n.data.type !== 'trigger' && n.data.type !== 'rate_limit')
-      .map((node) => {
-        const outgoing = adjacency.get(node.id) ?? []
-        const routing: any = {}
-        for (const edge of outgoing) {
-          const target = nodeMap.get(edge.target)
-          if (!target) continue
-          if (edge.condition === 'always')          routing.next       = target.id
-          else if (edge.condition === 'on_success') routing.on_success = target.id
-          else if (edge.condition === 'on_error')   routing.on_error   = target.id
-          else if (edge.condition === 'custom') {
-            routing.next      = target.id
-            routing.condition = edge.expression
-          }
-        }
-
-        if (node.data.type === 'transform') {
-          return {
-            type: 'transform',
-            name: node.id,
-            spec: { type: node.data.properties?.type || 'select', ...node.data.properties },
-            ...routing,
-          }
-        }
-        if (node.data.type === 'connector') {
-          const rawParams = { ...(node.data.properties?.params || {}) }
-          // Trim the params array to match the number of $N placeholders in the SQL
-          if (typeof rawParams.sql === 'string' && Array.isArray(rawParams.params)) {
-            const matches = rawParams.sql.match(/\$(\d+)/g) || []
-            const count = matches.length === 0 ? 0 : Math.max(...matches.map((m: string) => parseInt(m.slice(1), 10)))
-            rawParams.params = rawParams.params.slice(0, count)
-          }
-          return {
-            type: 'call',
-            name: node.id,
-            connector: node.data.properties?.instance || '',
-            operation: node.data.properties?.operation || '',
-            params: rawParams,
-            ...routing,
-          }
-        }
-        return { type: 'log', name: node.data.properties?.name || node.id, message: node.data.properties?.message || 'Log message', ...routing }
-      })
 
     const triggerType =
       triggerNode?.data.definition?.trigger_type ||
@@ -507,14 +452,70 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
             method: triggerNode?.data.properties?.method || 'POST',
           }
 
+    // Build FlowNodes (exclude trigger + rate_limit visual nodes)
+    const flowNodes = nodes
+      .filter((n) => n.data.type !== 'trigger' && n.data.type !== 'rate_limit')
+      .map((node) => {
+        let step: FlowStep
+        if (node.data.type === 'transform') {
+          step = {
+            type: 'transform',
+            name: node.id,
+            spec: { type: node.data.properties?.type || 'select', ...node.data.properties },
+          }
+        } else if (node.data.type === 'connector') {
+          const rawParams = { ...(node.data.properties?.params || {}) }
+          if (typeof rawParams.sql === 'string' && Array.isArray(rawParams.params)) {
+            const matches = rawParams.sql.match(/\$(\d+)/g) || []
+            const count = matches.length === 0 ? 0 : Math.max(...matches.map((m: string) => parseInt(m.slice(1), 10)))
+            rawParams.params = rawParams.params.slice(0, count)
+          }
+          step = {
+            type: 'call',
+            name: node.id,
+            connector: node.data.properties?.instance || '',
+            operation: node.data.properties?.operation || '',
+            params: rawParams,
+          }
+        } else {
+          step = {
+            type: 'log',
+            name: node.data.properties?.name || node.id,
+            message: node.data.properties?.message || 'Log message',
+          }
+        }
+        return {
+          id: node.id,
+          step,
+          position_x: node.position.x,
+          position_y: node.position.y,
+        }
+      })
+
+    // Build FlowEdges — skip edges that connect trigger_node to step nodes
+    // (trigger connectivity is implicit; the graph executor starts from root nodes)
+    const flowEdges = edges
+      .filter((e) => e.source !== 'trigger_node' && e.target !== 'trigger_node')
+      .filter((e) => e.source !== 'rate_limit_node' && e.target !== 'rate_limit_node')
+      .map((edge) => ({
+        id: edge.id,
+        from: edge.source,
+        to: edge.target,
+        condition: (edge.data?.condition === 'custom'
+          ? 'expression'
+          : edge.data?.condition ?? 'always') as EdgeCondition,
+        ...(edge.data?.expression ? { expression: edge.data.expression } : {}),
+      }))
+
     return {
       id: flowId || customFlowId.trim() || generatedId.current,
       name: flowName,
       trigger,
-      steps,
+      nodes: flowNodes,
+      edges: flowEdges,
       ...(rateLimit ? { rate_limit: rateLimit } : {}),
     }
-  }, [nodes, edges, flowId])
+  }, [nodes, edges, flowId, flowName, customFlowId])
 
   // ── Save ──────────────────────────────────────────────────────────────────
   const handleSave = async () => {

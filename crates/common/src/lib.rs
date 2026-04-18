@@ -165,19 +165,72 @@ pub struct TriggerDefinition {
     pub enabled: bool,
 }
 
+/// Graph node — wraps a FlowStep with position metadata for the visual editor
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowNode {
+    pub id: String,
+    pub step: FlowStep,
+    #[serde(default)]
+    pub position_x: f64,
+    #[serde(default)]
+    pub position_y: f64,
+}
+
+/// Directed edge between two graph nodes
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FlowEdge {
+    pub id: String,
+    pub from: String,
+    pub to: String,
+    #[serde(default)]
+    pub condition: EdgeCondition,
+    /// Template expression evaluated at runtime (used when condition == Expression)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expression: Option<String>,
+}
+
+/// When this edge is followed during execution
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum EdgeCondition {
+    /// Always traverse (default)
+    #[default]
+    Always,
+    /// Only when the source step succeeded
+    OnSuccess,
+    /// Only when the source step failed
+    OnError,
+    /// Evaluated from `expression` field at runtime
+    Expression,
+}
+
 /// Flow definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowDefinition {
     pub id: String,
     pub name: String,
     pub trigger: Trigger,
+    /// Graph-based execution model (preferred)
+    #[serde(default)]
+    pub nodes: Vec<FlowNode>,
+    #[serde(default)]
+    pub edges: Vec<FlowEdge>,
+    /// Legacy linear steps — kept for backwards compatibility
+    #[serde(default)]
     pub steps: Vec<FlowStep>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate_limit: Option<RateLimitPolicy>,
-     #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub circuit_breaker: Option<CircuitBreakerPolicy>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub retry: Option<RetryPolicy>,
+}
+
+impl FlowDefinition {
+    /// Returns true when this flow uses the graph execution model
+    pub fn is_graph_flow(&self) -> bool {
+        !self.nodes.is_empty()
+    }
 }
 
 /// Retry policy for flows

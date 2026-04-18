@@ -62,37 +62,52 @@ pub async fn test_flow(
     
     tracing::info!("🧪 Testing flow");
     
-    // Validate flow structure
-    if payload.flow["name"].is_null() || payload.flow["steps"].is_null() {
-        return Err(AppError::BadRequest("Invalid flow structure".to_string()));
+    // Validate flow structure — must have a name and either nodes (graph) or steps (legacy)
+    if payload.flow["name"].is_null() {
+        return Err(AppError::BadRequest("Invalid flow structure: missing name".to_string()));
     }
-    
-    let steps = payload.flow["steps"].as_array()
-        .ok_or_else(|| AppError::BadRequest("Missing steps array".to_string()))?;
-    
+    let has_nodes = payload.flow["nodes"].as_array().map_or(false, |a| !a.is_empty());
+    let has_steps = payload.flow["steps"].as_array().map_or(false, |a| !a.is_empty());
+    if !has_nodes && !has_steps {
+        return Err(AppError::BadRequest("Invalid flow structure: must have nodes or steps".to_string()));
+    }
+
+    // Collect the steps to test — from nodes for graph flows, otherwise from steps
+    let steps: Vec<&Value> = if has_nodes {
+        payload.flow["nodes"]
+            .as_array()
+            .map(|nodes| nodes.iter().map(|n| &n["step"]).collect())
+            .unwrap_or_default()
+    } else {
+        payload.flow["steps"]
+            .as_array()
+            .map(|s| s.iter().collect())
+            .unwrap_or_default()
+    };
+
     // Prepare test input
     let test_input = payload.test_input.unwrap_or_else(|| json!({}));
-    
+
     // Execute steps
     let mut step_results = Vec::new();
     let mut context = serde_json::Map::new();
     context.insert("trigger".to_string(), test_input);
-    
+
     let mut last_output = Value::Null;
     let mut execution_success = true;
-    
+
     for (index, step) in steps.iter().enumerate() {
         let step_start = std::time::Instant::now();
         let default_name = format!("step_{}", index);
         let step_name = step["name"].as_str().unwrap_or(&default_name);
         let step_type = step["type"].as_str().unwrap_or("unknown");
-        
+
         // Execute step
         let step_result = match execute_test_step(step, &context, &state).await {
             Ok(output) => {
                 context.insert(step_name.to_string(), output.clone());
                 last_output = output.clone();
-                
+
                 StepResult {
                     name: step_name.to_string(),
                     step_type: step_type.to_string(),
@@ -114,9 +129,9 @@ pub async fn test_flow(
                 }
             }
         };
-        
+
         step_results.push(step_result);
-        
+
         if !execution_success {
             break;
         }

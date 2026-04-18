@@ -1308,15 +1308,24 @@ async fn listen_for_connector_instances(state: Arc<AppState>) -> Result<()> {
 
 // ─── Dynamic Connector Connection Helper ─────────────────────────────────────
 
-/// Extract unique connector IDs from flow steps and connect them
+/// Extract unique connector IDs from a flow and connect them.
+/// Handles both graph flows (nodes) and legacy linear flows (steps).
 async fn connect_flow_connectors(
     state: &AppState,
     flow: &FlowDefinition,
 ) -> Result<()> {
     use common::FlowStep;
-    
+
     let mut connector_ids = std::collections::HashSet::new();
-    
+
+    // Graph flow: collect connectors from nodes
+    for node in &flow.nodes {
+        if let FlowStep::Call { connector, .. } = &node.step {
+            connector_ids.insert(connector.clone());
+        }
+    }
+
+    // Legacy linear flow: collect connectors from steps
     for step in &flow.steps {
         if let FlowStep::Call { connector, .. } = step {
             connector_ids.insert(connector.clone());
