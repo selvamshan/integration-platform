@@ -37,6 +37,7 @@ mod state;
 mod error;
 mod crypto;
 mod keycloak;
+mod oidc;
 mod rbac;
 mod transformers;
 mod handlers;
@@ -44,7 +45,7 @@ mod audit;
 mod db_migrations;
 use error::AppError;
 use crypto::CryptoService;
-use keycloak::KeycloakConfig;
+use oidc::OidcAuth;
 use rbac::{permission_middleware, rbac_middleware};
 use audit::AuditLogger;
 use handlers::flow::{list_flows, 
@@ -97,25 +98,8 @@ async fn main() -> Result<()> {
     let crypto = Arc::new(CryptoService::new()?);
     tracing::info!("✅ Encryption service initialized");
 
-    // Initialize Keycloak (optional - falls back to JWT if not configured)
-    let keycloak = match KeycloakConfig::from_env() {
-        Ok(kc) => {
-            tracing::info!("✅ Keycloak integration enabled");
-            Arc::new(kc)
-        }
-        Err(e) => {
-            tracing::warn!("⚠️  Keycloak not configured: {}", e);
-            tracing::warn!("   Falling back to JWT-only authentication");
-            // Create dummy config - won't be used if KEYCLOAK_CLIENT_SECRET not set
-            Arc::new(KeycloakConfig {
-                server_url: String::new(),
-                realm: String::new(),
-                client_id: String::new(),
-                client_secret: String::new(),
-                http_client: reqwest::Client::new(),
-            })
-        }
-    };
+    // Initialize OIDC provider (Keycloak / Auth0 / Okta via OIDC_PROVIDER env var)
+    let oidc = Arc::new(OidcAuth::from_env());
 
     run_migrations(&db).await?;
     
@@ -131,7 +115,7 @@ async fn main() -> Result<()> {
         rate_limit_stats: Arc::new(RwLock::new(HashMap::new())),
         jwt_secret,
         crypto,
-        keycloak: keycloak.clone(),
+        oidc: oidc.clone(),
         audit_logger: Arc::new(AuditLogger::new(db.clone())),
     });
 
@@ -238,7 +222,7 @@ async fn main() -> Result<()> {
         // ── RBAC Middleware (comment out to disable) ──────────────────────
         // Uncomment these lines to enable Keycloak-based RBAC:
         .layer(middleware::from_fn(permission_middleware))
-        .layer(middleware::from_fn_with_state(keycloak.clone(), rbac_middleware))
+        .layer(middleware::from_fn_with_state(oidc.clone(), rbac_middleware))
         .layer(cors)
         .layer(TraceLayer::new_for_http())
         .layer(CatchPanicLayer::new())
@@ -1326,7 +1310,7 @@ async fn invite_user(
         .ok_or_else(|| AppError::Internal(format!("Invalid role: {}", body.role)))?;
 
     // Invite user via Keycloak
-    let user_id = state.keycloak.invite_user(&body.email, &role).await
+    let user_id = state.oidc.invite_user(&body.email, &role).await
         .map_err(|e| AppError::Internal(format!("Keycloak invitation failed: {}", e)))?;
 
     // Store invitation in database
@@ -1364,7 +1348,7 @@ struct InviteUserBody {
 async fn list_users(
     State(state): State<Arc<AppState>>,
 ) -> Result<Json<Value>, AppError> {
-    let users = state.keycloak.list_users().await
+    let users = state.oidc.list_users().await
         .map_err(|e| AppError::Internal(format!("Failed to list users: {}", e)))?;
 
     Ok(Json(json!({
@@ -1378,7 +1362,7 @@ async fn delete_user(
     State(state): State<Arc<AppState>>,
     Path(user_id): Path<String>,
 ) -> Result<Json<Value>, AppError> {
-    state.keycloak.delete_user(&user_id).await
+    state.oidc.delete_user(&user_id).await
         .map_err(|e| AppError::Internal(format!("Failed to delete user: {}", e)))?;
 
     tracing::info!("🗑️  User deleted: {}", user_id);

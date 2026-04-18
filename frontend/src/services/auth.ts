@@ -1,113 +1,156 @@
 import axios from 'axios'
+import { getOidcConfig, OidcConfig } from '@/store/setupStore'
 
-const KEYCLOAK_URL = import.meta.env.VITE_KEYCLOAK_URL || '/keycloak'
-const REALM = import.meta.env.VITE_KEYCLOAK_REALM || 'integration-platform'
-const CLIENT_ID = import.meta.env.VITE_KEYCLOAK_CLIENT_ID || 'control-plane'
-const CLIENT_SECRET = import.meta.env.VITE_KEYCLOAK_CLIENT_SECRET || ''
+function tokenUrl(cfg: OidcConfig): string {
+  switch (cfg.provider) {
+    case 'auth0':
+      return `https://${cfg.auth0Domain}/oauth/token`
+    case 'okta':
+      return `https://${cfg.oktaDomain}/oauth2/${cfg.oktaAuthServerId}/v1/token`
+    default:
+      return `${cfg.keycloakUrl}/realms/${cfg.realm}/protocol/openid-connect/token`
+  }
+}
+
+function userInfoUrl(cfg: OidcConfig): string {
+  switch (cfg.provider) {
+    case 'auth0':
+      return `https://${cfg.auth0Domain}/userinfo`
+    case 'okta':
+      return `https://${cfg.oktaDomain}/oauth2/${cfg.oktaAuthServerId}/v1/userinfo`
+    default:
+      return `${cfg.keycloakUrl}/realms/${cfg.realm}/protocol/openid-connect/userinfo`
+  }
+}
+
+function logoutUrl(cfg: OidcConfig): string {
+  switch (cfg.provider) {
+    case 'auth0':
+      return `https://${cfg.auth0Domain}/v2/logout`
+    case 'okta':
+      return `https://${cfg.oktaDomain}/oauth2/${cfg.oktaAuthServerId}/v1/logout`
+    default:
+      return `${cfg.keycloakUrl}/realms/${cfg.realm}/protocol/openid-connect/logout`
+  }
+}
+
+function discoveryUrl(cfg: OidcConfig): string {
+  switch (cfg.provider) {
+    case 'auth0':
+      return `https://${cfg.auth0Domain}/.well-known/openid-configuration`
+    case 'okta':
+      return `https://${cfg.oktaDomain}/oauth2/${cfg.oktaAuthServerId}/.well-known/openid-configuration`
+    default:
+      return `${cfg.keycloakUrl}/realms/${cfg.realm}/.well-known/openid-configuration`
+  }
+}
 
 export const authService = {
-  /**
-   * Login with Keycloak using Resource Owner Password Credentials flow
-   */
   async login(username: string, password: string) {
-    const tokenUrl = `${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token`
-    
+    const cfg = getOidcConfig()
+    const url = tokenUrl(cfg)
+
     const params = new URLSearchParams({
-      client_id: CLIENT_ID,
       grant_type: 'password',
       username,
       password,
       scope: 'openid profile email',
     })
 
-    // Add client_secret if configured
-    if (CLIENT_SECRET) {
-      params.append('client_secret', CLIENT_SECRET)
+    switch (cfg.provider) {
+      case 'auth0':
+        params.append('client_id', cfg.clientId || cfg.auth0Domain)
+        params.append('client_secret', cfg.clientSecret)
+        params.append('audience', cfg.auth0Audience)
+        break
+      case 'okta':
+        params.append('client_id', cfg.clientId)
+        params.append('client_secret', cfg.clientSecret)
+        break
+      default:
+        params.append('client_id', cfg.clientId)
+        if (cfg.clientSecret) params.append('client_secret', cfg.clientSecret)
     }
 
-    const response = await axios.post(tokenUrl, params, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+    const response = await axios.post(url, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     })
-    console.log(response.data)
     return response.data
   },
 
-  /**
-   * Refresh access token using refresh token
-   */
   async refreshToken(refreshToken: string) {
-    const tokenUrl = `${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/token`
-    
+    const cfg = getOidcConfig()
+    const url = tokenUrl(cfg)
+
     const params = new URLSearchParams({
-      client_id: CLIENT_ID,
       grant_type: 'refresh_token',
       refresh_token: refreshToken,
     })
 
-    if (CLIENT_SECRET) {
-      params.append('client_secret', CLIENT_SECRET)
+    switch (cfg.provider) {
+      case 'auth0':
+        params.append('client_id', cfg.clientId)
+        params.append('client_secret', cfg.clientSecret)
+        break
+      case 'okta':
+        params.append('client_id', cfg.clientId)
+        params.append('client_secret', cfg.clientSecret)
+        break
+      default:
+        params.append('client_id', cfg.clientId)
+        if (cfg.clientSecret) params.append('client_secret', cfg.clientSecret)
     }
 
-    const response = await axios.post(tokenUrl, params, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+    const response = await axios.post(url, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     })
-
     return response.data
   },
 
-  /**
-   * Get user info from Keycloak
-   */
   async getUserInfo(token: string) {
-    const userInfoUrl = `${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/userinfo`
-    
-    const response = await axios.get(userInfoUrl, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+    const cfg = getOidcConfig()
+    const response = await axios.get(userInfoUrl(cfg), {
+      headers: { Authorization: `Bearer ${token}` },
     })
-
     return response.data
   },
 
-  /**
-   * Validate token with Control Plane
-   */
   async validateWithControlPlane(token: string) {
-    const controlPlaneUrl = import.meta.env.VITE_CONTROL_PLANE_URL || 'http://localhost:8081'
-    
-    const response = await axios.get(`${controlPlaneUrl}/users/me`, {
-      headers: {
-        Authorization: `Bearer ${token}`,
-      },
+    const cfg = getOidcConfig()
+    const response = await axios.get(`${cfg.controlPlaneUrl}/users/me`, {
+      headers: { Authorization: `Bearer ${token}` },
     })
-
     return response.data
   },
 
-  /**
-   * Logout (revoke token)
-   */
-  async logout(token: string, refreshToken: string) {
-    const logoutUrl = `${KEYCLOAK_URL}/realms/${REALM}/protocol/openid-connect/logout`
-    
+  async logout(_token: string, refreshToken: string) {
+    const cfg = getOidcConfig()
+    const url = logoutUrl(cfg)
+
+    if (cfg.provider === 'auth0') {
+      // Auth0 uses a redirect-based logout; best-effort token revoke
+      const params = new URLSearchParams({
+        client_id: cfg.clientId,
+        token: refreshToken,
+      })
+      await axios.post(`https://${cfg.auth0Domain}/oauth/revoke`, params, {
+        headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      }).catch(() => {})
+      return
+    }
+
     const params = new URLSearchParams({
-      client_id: CLIENT_ID,
+      client_id: cfg.clientId,
       refresh_token: refreshToken,
     })
+    if (cfg.clientSecret) params.append('client_secret', cfg.clientSecret)
 
-    if (CLIENT_SECRET) {
-      params.append('client_secret', CLIENT_SECRET)
-    }
-
-    await axios.post(logoutUrl, params, {
-      headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
-      },
+    await axios.post(url, params, {
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
     })
+  },
+
+  async testConnection(cfg: OidcConfig): Promise<void> {
+    await axios.get(discoveryUrl(cfg), { timeout: 8000 })
   },
 }

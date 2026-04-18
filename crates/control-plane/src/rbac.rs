@@ -1,4 +1,4 @@
-//! RBAC middleware for Control Plane endpoints
+//! RBAC middleware — validates OIDC JWT (Keycloak / Auth0 / Okta) and checks permissions.
 
 use std::sync::Arc;
 use axum::{
@@ -10,17 +10,18 @@ use axum::{
 };
 use serde_json::json;
 use common::{User, Permission};
-use crate::keycloak::KeycloakConfig;
+use crate::oidc::OidcAuth;
 
-/// RBAC middleware - validates Keycloak JWT and checks permissions
+/// Validates the Bearer token with the configured OIDC provider and injects a `User`
+/// extension into the request for downstream handlers.
 pub async fn rbac_middleware(
-    State(keycloak): State<Arc<KeycloakConfig>>,
+    State(oidc): State<Arc<OidcAuth>>,
     headers: HeaderMap,
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    // Extract Bearer token
-    tracing::info!("RBAC middleware authentication");
+    tracing::info!("RBAC middleware — provider: {}", oidc.provider_name());
+
     let token = match extract_bearer_token(&headers) {
         Some(t) => t,
         None => {
@@ -28,141 +29,127 @@ pub async fn rbac_middleware(
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
                     "error": "Missing or invalid Authorization header",
-                    "hint": "Use: Authorization: Bearer <keycloak-token>"
-                }))
+                    "hint":  "Use: Authorization: Bearer <token>"
+                })),
             ).into_response();
         }
     };
 
-    // Validate token with Keycloak
-    let user = match keycloak.validate_token(token).await {
+    let user = match oidc.validate_token(token).await {
         Ok(u) => u,
         Err(e) => {
-            tracing::warn!("Token validation failed: {}", e);
+            tracing::warn!("Token validation failed ({}): {}", oidc.provider_name(), e);
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({
-                    "error": "Invalid or expired token",
-                    "details": e.to_string()
-                }))
+                    "error":    "Invalid or expired token",
+                    "provider": oidc.provider_name(),
+                    "details":  e.to_string()
+                })),
             ).into_response();
         }
     };
 
     tracing::info!("🔓 Authenticated: {} (roles: {:?})", user.username, user.roles);
-
-    // Store user in request extensions
     request.extensions_mut().insert(user);
-
     next.run(request).await
 }
 
-/// Extract required permission from request path and method
+/// Maps HTTP method + path to a required `Permission`.
+/// Returns `None` for public endpoints.
 pub fn extract_permission(path: &str, method: &str) -> Option<Permission> {
     match (method, path) {
-        // Flow permissions
-        ("GET", p) if p.starts_with("/flows") => Some(Permission::ReadFlows),
-        ("POST", "/flows") => Some(Permission::WriteFlows),
-        ("PUT", p) if p.starts_with("/flows/") => Some(Permission::WriteFlows),
-        ("DELETE", p) if p.starts_with("/flows/") => Some(Permission::DeleteFlows),
-        
-        // Connector permissions
-        ("GET", p) if p.starts_with("/connector-instances") => Some(Permission::ReadConnectors),
-        ("POST", "/connector-instances") => Some(Permission::WriteConnectors),
-        ("DELETE", p) if p.starts_with("/connector-instances/") => Some(Permission::DeleteConnectors),
-        
-        // API permissions
-        ("GET", p) if p.starts_with("/apis") => Some(Permission::ReadApis),
-        ("POST", "/apis") => Some(Permission::WriteApis),
-        ("DELETE", p) if p.starts_with("/apis/") => Some(Permission::DeleteApis),
-        
-        // Client permissions
-        ("GET", p) if p.starts_with("/auth/clients") => Some(Permission::ReadClients),
-        ("POST", "/auth/clients") => Some(Permission::WriteClients),
-        ("DELETE", p) if p.starts_with("/auth/clients/") => Some(Permission::DeleteClients),
-        ("PATCH", p) if p.starts_with("/auth/clients/") => Some(Permission::WriteClients),
-        
-        // Monitoring permissions
-        ("GET", "/metrics") => Some(Permission::ReadMetrics),
-        ("GET", "/rate-limit-stats") => Some(Permission::ReadRateLimits),
-        
-        // User management (admin only)
-        ("GET", "/users") => Some(Permission::ManageUsers),
-        ("POST", "/users/invite") => Some(Permission::InviteUsers),
-        ("DELETE", p) if p.starts_with("/users/") => Some(Permission::ManageUsers),
-        
-        // Audit log permissions
-        ("GET", "/audit-logs") => Some(Permission::ReadAuditLogs),
-        ("GET", p) if p.ends_with("/audit-logs") => Some(Permission::ReadAuditLogs),
+        // Flows
+        ("GET",    p) if p.starts_with("/flows")           => Some(Permission::ReadFlows),
+        ("POST",   "/flows")                               => Some(Permission::WriteFlows),
+        ("PUT",    p) if p.starts_with("/flows/")          => Some(Permission::WriteFlows),
+        ("DELETE", p) if p.starts_with("/flows/")          => Some(Permission::DeleteFlows),
 
-        // Public endpoints (no permission required)
-        ("GET", "/health") => None,
-        ("POST", "/auth/token") => None,  // Token issuance is public
-        
+        // Connectors
+        ("GET",    p) if p.starts_with("/connector-instances") => Some(Permission::ReadConnectors),
+        ("POST",   "/connector-instances")                 => Some(Permission::WriteConnectors),
+        ("PUT",    p) if p.starts_with("/connector-instances/") => Some(Permission::WriteConnectors),
+        ("DELETE", p) if p.starts_with("/connector-instances/") => Some(Permission::DeleteConnectors),
+
+        // APIs
+        ("GET",    p) if p.starts_with("/apis")            => Some(Permission::ReadApis),
+        ("POST",   "/apis")                                => Some(Permission::WriteApis),
+        ("DELETE", p) if p.starts_with("/apis/")           => Some(Permission::DeleteApis),
+
+        // Auth clients
+        ("GET",    p) if p.starts_with("/auth/clients")    => Some(Permission::ReadClients),
+        ("POST",   "/auth/clients")                        => Some(Permission::WriteClients),
+        ("DELETE", p) if p.starts_with("/auth/clients/")   => Some(Permission::DeleteClients),
+        ("PATCH",  p) if p.starts_with("/auth/clients/")   => Some(Permission::WriteClients),
+
+        // Monitoring
+        ("GET", "/metrics")                                => Some(Permission::ReadMetrics),
+        ("GET", "/rate-limit-stats")                       => Some(Permission::ReadRateLimits),
+
+        // User management
+        ("GET",    "/users")                               => Some(Permission::ManageUsers),
+        ("POST",   "/users/invite")                        => Some(Permission::InviteUsers),
+        ("DELETE", p) if p.starts_with("/users/")          => Some(Permission::ManageUsers),
+
+        // Audit logs
+        ("GET", "/audit-logs")                             => Some(Permission::ReadAuditLogs),
+        ("GET", p) if p.ends_with("/audit-logs")           => Some(Permission::ReadAuditLogs),
+
+        // Public
+        ("GET",  "/health")      => None,
+        ("POST", "/auth/token")  => None,
+        ("GET",  "/users/me")    => None,
+
         _ => None,
     }
 }
 
-/// Permission check middleware - must be used AFTER rbac_middleware
-pub async fn permission_middleware(
-    request: Request<Body>,
-    next: Next,
-) -> Response {
-    let path = request.uri().path().to_string();
+/// Permission check middleware — must run **after** `rbac_middleware`.
+pub async fn permission_middleware(request: Request<Body>, next: Next) -> Response {
+    let path   = request.uri().path().to_string();
     let method = request.method().as_str().to_string();
-    tracing::info!("Permission check middleware {}", &path);
-    // Get user from extensions (set by rbac_middleware)
+    tracing::info!("Permission check: {} {}", method, path);
+
     let user = match request.extensions().get::<User>() {
         Some(u) => u.clone(),
         None => {
-            // No user found - should have been set by rbac_middleware
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({"error": "No user context found"}))
+                Json(json!({"error": "No user context — rbac_middleware must run first"})),
             ).into_response();
         }
     };
 
-    // Extract required permission
-    let required_permission = match extract_permission(&path, &method) {
+    let required = match extract_permission(&path, &method) {
         Some(p) => p,
-        None => {
-            // No permission required (public endpoint)
-            return next.run(request).await;
-        }
+        None    => return next.run(request).await,   // public endpoint
     };
 
-    // Check if user has permission
-    if !user.can(&required_permission) {
+    if !user.can(&required) {
         tracing::warn!(
-            "🔒 Access denied: {} tried to access {} {} (requires {:?})",
-            user.username, method, path, required_permission
+            "🔒 Access denied: {} → {} {} (requires {:?})",
+            user.username, method, path, required
         );
-
         return (
             StatusCode::FORBIDDEN,
             Json(json!({
-                "error": "Insufficient permissions",
-                "required": format!("{:?}", required_permission),
+                "error":      "Insufficient permissions",
+                "required":   format!("{:?}", required),
                 "your_roles": user.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>(),
-                "hint": "Contact admin to request access"
-            }))
+                "hint":       "Contact an admin to request access"
+            })),
         ).into_response();
     }
 
-    tracing::debug!("✅ Permission check passed: {} for {}", user.username, path);
-
+    tracing::debug!("✅ {} granted {} {}", user.username, method, path);
     next.run(request).await
 }
 
 fn extract_bearer_token(headers: &HeaderMap) -> Option<&str> {
-    headers.get("authorization")?
-        .to_str().ok()?
-        .strip_prefix("Bearer ")
-        .or_else(|| headers.get("authorization")?.to_str().ok()?.strip_prefix("bearer "))
+    let val = headers.get("authorization")?.to_str().ok()?;
+    val.strip_prefix("Bearer ").or_else(|| val.strip_prefix("bearer "))
 }
 
-/// Helper to get current user from request extensions
 pub fn get_current_user(request: &Request<Body>) -> Option<&User> {
     request.extensions().get::<User>()
 }
