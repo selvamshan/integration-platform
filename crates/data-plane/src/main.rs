@@ -1217,6 +1217,8 @@ fn _create_default_flow(path: &str) -> FlowDefinition {
             path: format!("/{}", path),
             method: "GET".to_string(),
         },
+        nodes: vec![],
+        edges: vec![],
         steps: vec![
             FlowStep::Log {
                 name: "trigger".to_string(),

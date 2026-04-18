@@ -24,14 +24,14 @@ pub enum StepOutcome {
 ///   5. Repeat until the queue is empty.
 ///   6. Return the message produced by the last node to execute (or the
 ///      input message if no nodes ran).
-pub async fn execute_graph<F, Fut>(
-    flow: &FlowDefinition,
+pub async fn execute_graph<'a, F, Fut>(
+    flow: &'a FlowDefinition,
     input: Message,
     execute_node: F,
 ) -> Result<Message>
 where
-    F: Fn(&FlowNode, Message) -> Fut,
-    Fut: std::future::Future<Output = Result<Message>>,
+    F: Fn(&'a FlowNode, Message) -> Fut,
+    Fut: std::future::Future<Output = Result<Message>> + 'a,
 {
     if flow.nodes.is_empty() {
         return Ok(input);

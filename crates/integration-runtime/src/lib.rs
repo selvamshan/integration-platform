@@ -34,12 +34,12 @@ impl FlowExecutor {
 
     /// Execute a flow — dispatches to graph executor when nodes are present,
     /// falls back to linear executor for legacy step-only flows.
-    pub async fn execute_flow(&self, flow: &FlowDefinition, input: Message) -> Result<Message> {
+    pub async fn execute_flow<'a>(&'a self, flow: &'a FlowDefinition, input: Message) -> Result<Message> {
         info!("🚀 Executing flow: {}", flow.name);
         let result = if flow.is_graph_flow() {
             info!("   mode: graph ({} nodes, {} edges)", flow.nodes.len(), flow.edges.len());
             graph_executor::execute_graph(flow, input, |node, msg| {
-                self.execute_step(&node.step, msg)
+                Box::pin(self.execute_step(&node.step, msg))
             }).await?
         } else {
             info!("   mode: linear ({} steps)", flow.steps.len());

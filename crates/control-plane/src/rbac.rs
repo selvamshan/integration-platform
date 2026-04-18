@@ -12,6 +12,18 @@ use serde_json::json;
 use common::{User, Permission};
 use crate::oidc::OidcAuth;
 
+fn is_public_path(path: &str, method: &str) -> bool {
+    match (method, path) {
+        ("GET",  "/health") | ("POST", "/auth/token") | ("GET", "/users/me") => true,
+        ("GET", p) => {
+            p == "/connectors" || p.starts_with("/connectors/")
+                || p == "/triggers" || p.starts_with("/triggers/")
+                || p == "/transformers" || p.starts_with("/transformers/")
+        }
+        _ => false,
+    }
+}
+
 /// Validates the Bearer token with the configured OIDC provider and injects a `User`
 /// extension into the request for downstream handlers.
 pub async fn rbac_middleware(
@@ -20,6 +32,13 @@ pub async fn rbac_middleware(
     mut request: Request<Body>,
     next: Next,
 ) -> Response {
+    let path   = request.uri().path();
+    let method = request.method().as_str();
+
+    if is_public_path(path, method) {
+        return next.run(request).await;
+    }
+
     tracing::info!("RBAC middleware — provider: {}", oidc.provider_name());
 
     let token = match extract_bearer_token(&headers) {
@@ -110,6 +129,11 @@ pub async fn permission_middleware(request: Request<Body>, next: Next) -> Respon
     let method = request.method().as_str().to_string();
     tracing::info!("Permission check: {} {}", method, path);
 
+    let required = match extract_permission(&path, &method) {
+        Some(p) => p,
+        None    => return next.run(request).await,   // public endpoint — no user needed
+    };
+
     let user = match request.extensions().get::<User>() {
         Some(u) => u.clone(),
         None => {
@@ -118,11 +142,6 @@ pub async fn permission_middleware(request: Request<Body>, next: Next) -> Respon
                 Json(json!({"error": "No user context — rbac_middleware must run first"})),
             ).into_response();
         }
-    };
-
-    let required = match extract_permission(&path, &method) {
-        Some(p) => p,
-        None    => return next.run(request).await,   // public endpoint
     };
 
     if !user.can(&required) {
