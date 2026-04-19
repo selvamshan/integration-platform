@@ -58,7 +58,17 @@ export const useSetupStore = create<SetupState>()(
       markConfigured: () => set({ isConfigured: true }),
       reset: () => set({ ...DEFAULTS, isConfigured: false }),
     }),
-    { name: 'oidc-setup' }
+    {
+      name: 'oidc-setup',
+      version: 1,
+      migrate: (persisted: unknown, version: number) => {
+        const state = persisted as Partial<OidcConfig & { isConfigured: boolean }>
+        if (version < 1) {
+          state.controlPlaneUrl = DEFAULTS.controlPlaneUrl
+        }
+        return state
+      },
+    }
   )
 )
 

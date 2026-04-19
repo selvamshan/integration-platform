@@ -24,9 +24,15 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
       .finally(() => setLoadingDefs(false))
   }, [])
 
-  const { register, handleSubmit, watch } = useForm<Connector>({
+  const { register, handleSubmit, watch, setValue } = useForm<Connector>({
     defaultValues: initialValues ?? { connector_type: 'postgres' },
   })
+
+  useEffect(() => {
+    if (!loadingDefs && isEdit && initialValues?.connector_type) {
+      setValue('connector_type', initialValues.connector_type)
+    }
+  }, [loadingDefs, isEdit, initialValues, setValue])
 
   const connectorType = watch('connector_type')
   const isDb = connectorType === 'postgres' || connectorType === 'mysql'
@@ -53,6 +59,12 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
         setExtraAttrsError('Invalid JSON — fix before submitting')
         return
       }
+    }
+    // Postgres/MySQL host must be a plain hostname or IP, not a URL
+    const isDbConnector = data.connector_type === 'postgres' || data.connector_type === 'mysql'
+    if (isDbConnector && data.host && /^https?:\/\//i.test(data.host)) {
+      alert('Host must be a hostname or IP address (e.g. localhost), not a URL')
+      return
     }
     onSubmit(data)
   }

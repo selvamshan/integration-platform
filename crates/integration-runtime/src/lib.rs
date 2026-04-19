@@ -32,6 +32,11 @@ impl FlowExecutor {
         self.connectors.insert(name, connector);
     }
 
+    /// Returns true if a connector with this name is already registered.
+    pub fn has_connector(&self, name: &str) -> bool {
+        self.connectors.contains_key(name)
+    }
+
     /// Execute a flow — dispatches to graph executor when nodes are present,
     /// falls back to linear executor for legacy step-only flows.
     pub async fn execute_flow<'a>(&'a self, flow: &'a FlowDefinition, input: Message) -> Result<Message> {

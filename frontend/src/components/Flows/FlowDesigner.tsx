@@ -114,6 +114,17 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
   const [testResult, setTestResult] = useState<TestFlowResult | null>(null)
   const [testInput, setTestInput] = useState('')
 
+  // HTTP tester state
+  const [showHttpTester, setShowHttpTester] = useState(false)
+  const [httpMethod, setHttpMethod] = useState('POST')
+  const [httpPath, setHttpPath] = useState('/api/webhook')
+  const [httpActiveTab, setHttpActiveTab] = useState<'params' | 'headers' | 'body'>('body')
+  const [httpQueryParams, setHttpQueryParams] = useState<{ key: string; value: string }[]>([{ key: '', value: '' }])
+  const [httpHeaders, setHttpHeaders] = useState<{ key: string; value: string }[]>([{ key: 'Content-Type', value: 'application/json' }])
+  const [httpBody, setHttpBody] = useState('{\n  \n}')
+  const [httpSending, setHttpSending] = useState(false)
+  const [httpResponse, setHttpResponse] = useState<{ status: number; statusText: string; headers: Record<string, string>; body: string; durationMs: number } | null>(null)
+
   // ── Connections ──────────────────────────────────────────────────────────
   const onConnect = useCallback(
     (connection: Connection) => {
@@ -332,7 +343,11 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
             y: fn.position_y ?? 200,
           }))
         }
-        for (const fe of initialFlow.edges) {
+        const validNodeIds = new Set(initialFlow.nodes.map((n) => n.id))
+        const validEdges = initialFlow.edges.filter(
+          (fe) => validNodeIds.has(fe.from) && validNodeIds.has(fe.to),
+        )
+        for (const fe of validEdges) {
           newEdges.push({
             id: fe.id,
             source: fe.from,
@@ -345,7 +360,7 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
           })
         }
         // Connect trigger → first root node (nodes with no incoming edges)
-        const targetIds = new Set(initialFlow.edges.map((e) => e.to))
+        const targetIds = new Set(validEdges.map((e) => e.to))
         const rootNodes = initialFlow.nodes.filter((n) => !targetIds.has(n.id))
         for (const root of rootNodes) {
           newEdges.push({
@@ -492,11 +507,13 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
         }
       })
 
-    // Build FlowEdges — skip edges that connect trigger_node to step nodes
+    // Build FlowEdges — skip edges connected to trigger/rate_limit nodes
     // (trigger connectivity is implicit; the graph executor starts from root nodes)
+    const triggerIds = new Set(nodes.filter((n) => n.data.type === 'trigger').map((n) => n.id))
+    const rateLimitIds = new Set(nodes.filter((n) => n.data.type === 'rate_limit').map((n) => n.id))
     const flowEdges = edges
-      .filter((e) => e.source !== 'trigger_node' && e.target !== 'trigger_node')
-      .filter((e) => e.source !== 'rate_limit_node' && e.target !== 'rate_limit_node')
+      .filter((e) => !triggerIds.has(e.source) && !triggerIds.has(e.target))
+      .filter((e) => !rateLimitIds.has(e.source) && !rateLimitIds.has(e.target))
       .map((edge) => ({
         id: edge.id,
         from: edge.source,
@@ -564,22 +581,53 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
     return triggerType === 'schedule'
   }, [nodes])
 
+  const getHttpTriggerProps = useCallback(() => {
+    const triggerNode = nodes.find((n) => n.data.type === 'trigger')
+    return {
+      path: triggerNode?.data.properties?.path || '/api/webhook',
+      method: triggerNode?.data.properties?.method || 'POST',
+    }
+  }, [nodes])
+
   const handleOpenTestDialog = () => {
     if (isScheduleFlow()) {
-      const flow = buildFlow()
-      const now = new Date().toISOString()
-      const scheduleContext = {
-        type: 'schedule',
-        scheduled_time: now,
-        execution_time: now,
-        flow_id: flow.id,
-        flow_name: flow.name,
-      }
-      setTestInput(JSON.stringify(scheduleContext, null, 2))
+      // Schedule: run immediately without dialog
+      handleTestSchedule()
     } else {
-      setTestInput('')
+      // HTTP: show Postman-like tester
+      const { path, method } = getHttpTriggerProps()
+      setHttpPath(path)
+      setHttpMethod(method)
+      setHttpResponse(null)
+      setShowHttpTester(true)
     }
-    setShowTestInput(true)
+  }
+
+  const handleTestSchedule = async () => {
+    const flow = buildFlow()
+    const now = new Date().toISOString()
+    const scheduleContext = {
+      type: 'schedule',
+      scheduled_time: now,
+      execution_time: now,
+      flow_id: flow.id,
+      flow_name: flow.name,
+    }
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const result = await flowService.test(flow, scheduleContext)
+      setTestResult(result)
+    } catch (err: any) {
+      setTestResult({
+        success: false,
+        result: null,
+        error: err?.response?.data?.error ?? err?.message ?? 'Test failed',
+        execution: { duration_ms: 0, steps_executed: 0, step_results: [] },
+      })
+    } finally {
+      setTesting(false)
+    }
   }
 
   const handleTest = async () => {
@@ -603,6 +651,36 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
       })
     } finally {
       setTesting(false)
+    }
+  }
+
+  const handleSendHttpRequest = async () => {
+    const dataplaneUrl = import.meta.env.VITE_DATA_PLANE_URL || 'http://localhost:8080'
+    const params = httpQueryParams.filter((p) => p.key.trim())
+    const qs = params.length ? '?' + params.map((p) => `${encodeURIComponent(p.key)}=${encodeURIComponent(p.value)}`).join('&') : ''
+    const url = `${dataplaneUrl}${httpPath}${qs}`
+    const headers: Record<string, string> = {}
+    httpHeaders.filter((h) => h.key.trim()).forEach((h) => { headers[h.key] = h.value })
+
+    setHttpSending(true)
+    const t0 = Date.now()
+    try {
+      const res = await fetch(url, {
+        method: httpMethod,
+        headers,
+        body: ['GET', 'HEAD'].includes(httpMethod) ? undefined : httpBody,
+      })
+      const durationMs = Date.now() - t0
+      const resHeaders: Record<string, string> = {}
+      res.headers.forEach((v, k) => { resHeaders[k] = v })
+      const text = await res.text()
+      let body = text
+      try { body = JSON.stringify(JSON.parse(text), null, 2) } catch { /* not JSON */ }
+      setHttpResponse({ status: res.status, statusText: res.statusText, headers: resHeaders, body, durationMs })
+    } catch (err: any) {
+      setHttpResponse({ status: 0, statusText: 'Network Error', headers: {}, body: err?.message ?? 'Request failed', durationMs: Date.now() - t0 })
+    } finally {
+      setHttpSending(false)
     }
   }
 
@@ -793,6 +871,154 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
               Run Test
             </button>
           </div>
+        </div>
+      </div>
+    )}
+
+    {/* HTTP Tester (Postman-like) */}
+    {showHttpTester && (
+      <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onClick={() => setShowHttpTester(false)}>
+        <div className="bg-white rounded-xl shadow-2xl w-[760px] max-h-[90vh] flex flex-col" onClick={(e) => e.stopPropagation()}>
+          {/* Header */}
+          <div className="flex items-center justify-between px-5 py-3 border-b">
+            <h2 className="font-bold text-base">Test HTTP Trigger</h2>
+            <button onClick={() => setShowHttpTester(false)} className="hover:bg-gray-100 p-1.5 rounded"><X className="w-4 h-4" /></button>
+          </div>
+
+          {/* URL bar */}
+          <div className="flex items-center gap-2 px-4 py-3 border-b bg-gray-50">
+            <select
+              value={httpMethod}
+              onChange={(e) => setHttpMethod(e.target.value)}
+              className="border rounded px-2 py-1.5 text-sm font-medium bg-white w-24 focus:outline-none focus:ring-2 focus:ring-blue-300"
+            >
+              {['GET', 'POST', 'PUT', 'PATCH', 'DELETE'].map((m) => (
+                <option key={m}>{m}</option>
+              ))}
+            </select>
+            <div className="flex-1 flex items-center border rounded bg-white overflow-hidden focus-within:ring-2 focus-within:ring-blue-300">
+              <span className="text-xs text-gray-400 pl-2 pr-1 whitespace-nowrap">{import.meta.env.VITE_DATA_PLANE_URL || 'http://localhost:8080'}</span>
+              <input
+                value={httpPath}
+                onChange={(e) => setHttpPath(e.target.value)}
+                className="flex-1 py-1.5 pr-2 text-sm font-mono focus:outline-none"
+                placeholder="/api/webhook"
+              />
+            </div>
+            <button
+              onClick={handleSendHttpRequest}
+              disabled={httpSending}
+              className="btn btn-primary flex items-center gap-1.5 text-sm px-4 py-1.5 whitespace-nowrap"
+            >
+              <Play className="w-3.5 h-3.5" />
+              {httpSending ? 'Sending…' : 'Send'}
+            </button>
+          </div>
+
+          {/* Tabs */}
+          <div className="flex border-b text-sm">
+            {(['params', 'headers', 'body'] as const).map((tab) => (
+              <button
+                key={tab}
+                onClick={() => setHttpActiveTab(tab)}
+                className={`px-4 py-2 capitalize font-medium border-b-2 transition-colors ${httpActiveTab === tab ? 'border-blue-500 text-blue-600' : 'border-transparent text-gray-500 hover:text-gray-800'}`}
+              >
+                {tab}
+                {tab === 'params' && httpQueryParams.filter((p) => p.key.trim()).length > 0 && (
+                  <span className="ml-1.5 text-xs bg-blue-100 text-blue-600 rounded-full px-1.5">{httpQueryParams.filter((p) => p.key.trim()).length}</span>
+                )}
+                {tab === 'headers' && httpHeaders.filter((h) => h.key.trim()).length > 0 && (
+                  <span className="ml-1.5 text-xs bg-blue-100 text-blue-600 rounded-full px-1.5">{httpHeaders.filter((h) => h.key.trim()).length}</span>
+                )}
+              </button>
+            ))}
+          </div>
+
+          {/* Tab content */}
+          <div className="flex-1 overflow-auto min-h-0">
+            {/* Params tab */}
+            {httpActiveTab === 'params' && (
+              <div className="p-4 space-y-2">
+                {httpQueryParams.map((param, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      value={param.key}
+                      onChange={(e) => setHttpQueryParams((ps) => ps.map((p, j) => j === i ? { ...p, key: e.target.value } : p))}
+                      placeholder="Key"
+                      className="flex-1 border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    />
+                    <input
+                      value={param.value}
+                      onChange={(e) => setHttpQueryParams((ps) => ps.map((p, j) => j === i ? { ...p, value: e.target.value } : p))}
+                      placeholder="Value"
+                      className="flex-1 border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    />
+                    <button onClick={() => setHttpQueryParams((ps) => ps.filter((_, j) => j !== i))} className="text-gray-400 hover:text-red-500 px-1">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+                <button onClick={() => setHttpQueryParams((ps) => [...ps, { key: '', value: '' }])} className="text-sm text-blue-600 hover:underline">+ Add param</button>
+              </div>
+            )}
+
+            {/* Headers tab */}
+            {httpActiveTab === 'headers' && (
+              <div className="p-4 space-y-2">
+                {httpHeaders.map((header, i) => (
+                  <div key={i} className="flex gap-2">
+                    <input
+                      value={header.key}
+                      onChange={(e) => setHttpHeaders((hs) => hs.map((h, j) => j === i ? { ...h, key: e.target.value } : h))}
+                      placeholder="Key"
+                      className="flex-1 border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    />
+                    <input
+                      value={header.value}
+                      onChange={(e) => setHttpHeaders((hs) => hs.map((h, j) => j === i ? { ...h, value: e.target.value } : h))}
+                      placeholder="Value"
+                      className="flex-1 border rounded px-2 py-1.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-200"
+                    />
+                    <button onClick={() => setHttpHeaders((hs) => hs.filter((_, j) => j !== i))} className="text-gray-400 hover:text-red-500 px-1">
+                      <X className="w-4 h-4" />
+                    </button>
+                  </div>
+                ))}
+                <button onClick={() => setHttpHeaders((hs) => [...hs, { key: '', value: '' }])} className="text-sm text-blue-600 hover:underline">+ Add header</button>
+              </div>
+            )}
+
+            {/* Body tab */}
+            {httpActiveTab === 'body' && (
+              <div className="p-4 h-full">
+                {['GET', 'HEAD'].includes(httpMethod) ? (
+                  <p className="text-sm text-gray-400 italic">GET requests do not have a body.</p>
+                ) : (
+                  <textarea
+                    value={httpBody}
+                    onChange={(e) => setHttpBody(e.target.value)}
+                    rows={8}
+                    className="w-full border rounded-lg p-3 text-sm font-mono resize-y focus:outline-none focus:ring-2 focus:ring-blue-300"
+                    placeholder={'{\n  "key": "value"\n}'}
+                  />
+                )}
+              </div>
+            )}
+          </div>
+
+          {/* Response panel */}
+          {httpResponse !== null && (
+            <div className="border-t bg-gray-50">
+              <div className="flex items-center gap-3 px-4 py-2 border-b">
+                <span className="text-sm font-medium">Response</span>
+                <span className={`text-xs font-bold px-2 py-0.5 rounded ${httpResponse.status >= 200 && httpResponse.status < 300 ? 'bg-green-100 text-green-700' : 'bg-red-100 text-red-700'}`}>
+                  {httpResponse.status} {httpResponse.statusText}
+                </span>
+                <span className="text-xs text-gray-500 ml-auto">{httpResponse.durationMs}ms</span>
+              </div>
+              <pre className="p-4 text-xs font-mono overflow-auto max-h-48 whitespace-pre-wrap">{httpResponse.body}</pre>
+            </div>
+          )}
         </div>
       </div>
     )}

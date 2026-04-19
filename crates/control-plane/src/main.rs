@@ -1000,6 +1000,18 @@ async fn create_connector_instance(
     let id = body.id.unwrap_or_else(|| format!("conn_{}", uuid::Uuid::new_v4().simple()));
     
   
+    // Reject URL-shaped hosts for database connectors
+    let is_db = matches!(body.connector_type.as_str(), "postgres" | "mysql");
+    if is_db {
+        if let Some(host) = &body.host {
+            if host.starts_with("http://") || host.starts_with("https://") {
+                return Err(AppError::BadRequest(
+                    "Host must be a hostname or IP address, not a URL".into()
+                ));
+            }
+        }
+    }
+
     let password_encrypted: Option<String> = match body.password.as_deref() {
         Some(pwd) => Some(state.crypto.encrypt(pwd)
             .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?),
@@ -1212,22 +1224,8 @@ async fn update_connector_instance(
     .map_err(|e| AppError::Internal(e.to_string()))?;
     
     // Publish update event to NATS
-    let event = json!({
-        "event": "connector_instance_updated",
-        "instance": {
-            "id": updated.id,
-            "name": updated.name,
-            "connector_type": updated.connector_type,
-            "host": updated.host,
-            "port": updated.port,
-            "database": updated.database,
-            "username": updated.username,
-            "active": updated.active,
-            "extra_attributes": updated.extra_attributes,
-        }
-    });
-    
-    if let Err(e) = state.nats.publish("connector.updated", event.to_string().into()).await {
+    let event = common::ConnectorInstanceEvent::Updated { instance: updated.clone() };
+    if let Err(e) = publish_connector_instance_event(&state.nats, &event).await {
         tracing::warn!("Failed to publish connector update event: {}", e);
     }
     

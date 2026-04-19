@@ -25,6 +25,7 @@ impl Connector for PostgresConnector {
 
         let pool = PgPoolOptions::new()
             .max_connections(5)
+            .acquire_timeout(std::time::Duration::from_secs(10))
             .connect(&self.connection_string)
             .await
             .map_err(|e| Error::Connector(format!("Failed to connect to database: {}", e)))?;
