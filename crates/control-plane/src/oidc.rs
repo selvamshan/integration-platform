@@ -156,23 +156,28 @@ impl OidcAuth {
         }
     }
 
-    async fn get_decoding_key(&self) -> Result<DecodingKey> {
-        let resp: serde_json::Value = self.http
+    async fn fetch_jwks(&self) -> Result<serde_json::Value> {
+        self.http
             .get(self.jwks_url())
             .send().await?
-            .json().await?;
+            .json().await
+            .map_err(|e| anyhow!("Failed to fetch JWKS: {}", e))
+    }
 
-        let keys = resp["keys"].as_array()
-            .ok_or_else(|| anyhow!("No keys in JWKS ({})", self.provider_name()))?;
+    fn find_key<'a>(keys: &'a [serde_json::Value], kid: Option<&str>) -> Option<&'a serde_json::Value> {
+        if let Some(kid) = kid {
+            // Match by key ID — critical when Keycloak has multiple keys (rotation)
+            if let Some(k) = keys.iter().find(|k| k["kid"].as_str() == Some(kid)) {
+                return Some(k);
+            }
+        }
+        // Fallback: first RSA key
+        keys.iter().find(|k| k["kty"].as_str() == Some("RSA"))
+    }
 
-        let rsa_key = keys.iter()
-            .find(|k| k["kty"].as_str() == Some("RSA"))
-            .or_else(|| keys.first())
-            .ok_or_else(|| anyhow!("Empty JWKS"))?;
-
-        let n = rsa_key["n"].as_str().ok_or_else(|| anyhow!("Missing 'n' in JWKS"))?;
-        let e = rsa_key["e"].as_str().ok_or_else(|| anyhow!("Missing 'e' in JWKS"))?;
-
+    fn key_from_jwks_entry(rsa_key: &serde_json::Value) -> Result<DecodingKey> {
+        let n = rsa_key["n"].as_str().ok_or_else(|| anyhow!("Missing 'n' in JWKS key"))?;
+        let e = rsa_key["e"].as_str().ok_or_else(|| anyhow!("Missing 'e' in JWKS key"))?;
         DecodingKey::from_rsa_components(n, e)
             .map_err(|e| anyhow!("Failed to build decoding key: {}", e))
     }
@@ -180,14 +185,28 @@ impl OidcAuth {
     // ── Token validation ──────────────────────────────────────────────────────
 
     pub async fn validate_token(&self, token: &str) -> Result<User> {
-        let key = self.get_decoding_key().await?;
+        // Decode the JWT header (unverified) to get `kid`
+        let header = jsonwebtoken::decode_header(token)
+            .map_err(|e| anyhow!("Invalid JWT header: {}", e))?;
+
+        let jwks = self.fetch_jwks().await?;
+        let keys = jwks["keys"].as_array()
+            .ok_or_else(|| anyhow!("No keys in JWKS ({})", self.provider_name()))?;
+
+        let rsa_key = Self::find_key(keys, header.kid.as_deref())
+            .ok_or_else(|| anyhow!("No matching key in JWKS for kid={:?}", header.kid))?;
+
+        let key = Self::key_from_jwks_entry(rsa_key)?;
 
         let mut validation = Validation::new(Algorithm::RS256);
         validation.validate_exp = true;
 
         match &self.config {
-            OidcProviderConfig::Keycloak { client_id, .. } =>
-                validation.set_audience(&["account", client_id.as_str()]),
+            // Keycloak access tokens often omit `aud` unless audience mappers are
+            // explicitly configured in the realm. Signature + expiry is sufficient.
+            OidcProviderConfig::Keycloak { .. } => {
+                validation.validate_aud = false;
+            }
             OidcProviderConfig::Auth0 { audience, .. } =>
                 validation.set_audience(&[audience.as_str()]),
             OidcProviderConfig::Okta { audience, .. } =>

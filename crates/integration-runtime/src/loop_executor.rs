@@ -1,14 +1,21 @@
-use common::{Message, Result, Error, FlowStep};
+use common::{Message, Result, Error, FlowStep, FlowNode, FlowEdge};
 use serde_json::json;
 use tracing::{info, warn};
 
 use crate::templates::{evaluate_condition, resolve_template_str};
 
-/// Trait for anything that can execute a sequence of flow steps.
+/// Trait for anything that can execute a sequence of flow steps or a sub-graph.
 /// Implemented by `FlowExecutor` so `LoopExecutor` can call back into it.
 #[async_trait::async_trait]
 pub trait StepExecutor: Send + Sync {
     async fn run_steps(&self, steps: &[FlowStep], message: Message) -> Result<Message>;
+    async fn run_graph(&self, nodes: &[FlowNode], edges: &[FlowEdge], message: Message) -> Result<Message>;
+}
+
+/// Loop body — either a linear list of steps or a DAG sub-graph.
+pub enum LoopBody<'a> {
+    Steps(&'a [FlowStep]),
+    Graph { nodes: &'a [FlowNode], edges: &'a [FlowEdge] },
 }
 
 /// Loop step types
@@ -37,12 +44,13 @@ impl LoopExecutor {
         self
     }
 
-    /// Execute a loop, calling `executor.run_steps` for each iteration.
+    /// Execute a loop, calling back into `executor` for each iteration.
+    /// The body can be a linear list of steps or a DAG sub-graph.
     pub async fn execute(
         &self,
         name: &str,
         loop_type: LoopType,
-        steps: &[FlowStep],
+        body: LoopBody<'_>,
         mut message: Message,
         executor: &dyn StepExecutor,
     ) -> Result<Message> {
@@ -61,7 +69,7 @@ impl LoopExecutor {
                         map.insert("index".to_string(), json!(iteration));
                     }
 
-                    message = executor.run_steps(steps, message).await?;
+                    message = run_body(&body, message, executor).await?;
                     iteration += 1;
                 }
 
@@ -94,7 +102,7 @@ impl LoopExecutor {
                         map.insert("iteration".to_string(), json!(iteration + 1));
                     }
 
-                    message = executor.run_steps(steps, message).await?;
+                    message = run_body(&body, message, executor).await?;
                     iteration += 1;
                 }
             }
@@ -109,7 +117,7 @@ impl LoopExecutor {
                         map.insert("iteration".to_string(), json!(i + 1));
                     }
 
-                    message = executor.run_steps(steps, message).await?;
+                    message = run_body(&body, message, executor).await?;
                     iteration += 1;
                 }
             }
@@ -127,6 +135,13 @@ impl LoopExecutor {
 impl Default for LoopExecutor {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+async fn run_body(body: &LoopBody<'_>, message: Message, executor: &dyn StepExecutor) -> Result<Message> {
+    match body {
+        LoopBody::Steps(steps) => executor.run_steps(steps, message).await,
+        LoopBody::Graph { nodes, edges } => executor.run_graph(nodes, edges, message).await,
     }
 }
 
@@ -149,6 +164,10 @@ mod tests {
     #[async_trait::async_trait]
     impl StepExecutor for TestExecutor {
         async fn run_steps(&self, _steps: &[FlowStep], message: Message) -> Result<Message> {
+            Ok(message)
+        }
+
+        async fn run_graph(&self, _nodes: &[FlowNode], _edges: &[FlowEdge], message: Message) -> Result<Message> {
             Ok(message)
         }
     }

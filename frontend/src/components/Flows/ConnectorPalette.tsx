@@ -13,7 +13,8 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
   const [triggers, setTriggers] = useState<any[]>([])
   const [transformers, setTransformers] = useState<any[]>([])
   const [loading, setLoading] = useState(true)
-  
+  const [errors, setErrors] = useState<{ connectors?: string; triggers?: string; transformers?: string }>({})
+
   // Expandable sections
   const [expandedSections, setExpandedSections] = useState({
     triggers: true,
@@ -27,21 +28,37 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
   }, [])
 
   const loadAll = async () => {
-    try {
-      const [connectorsData, triggersData, transformersData] = await Promise.all([
-        connectorDefinitionService.list(),
-        triggerDefinitionService.list(),
-        transformerService.list(),
-      ])
-      
-      setConnectors(connectorsData.connectors || [])
-      setTriggers(triggersData.triggers || [])
-      setTransformers(transformersData.transformers || [])
-    } catch (error) {
-      console.error('Failed to load palette:', error)
-    } finally {
-      setLoading(false)
+    const newErrors: typeof errors = {}
+
+    const [connectorsResult, triggersResult, transformersResult] = await Promise.allSettled([
+      connectorDefinitionService.list(),
+      triggerDefinitionService.list(),
+      transformerService.list(),
+    ])
+
+    if (connectorsResult.status === 'fulfilled') {
+      setConnectors(connectorsResult.value.connectors || [])
+    } else {
+      console.error('Failed to load connectors:', connectorsResult.reason)
+      newErrors.connectors = 'Could not load connectors'
     }
+
+    if (triggersResult.status === 'fulfilled') {
+      setTriggers(triggersResult.value.triggers || [])
+    } else {
+      console.error('Failed to load triggers:', triggersResult.reason)
+      newErrors.triggers = 'Could not load triggers'
+    }
+
+    if (transformersResult.status === 'fulfilled') {
+      setTransformers(transformersResult.value.transformers || [])
+    } else {
+      console.error('Failed to load transformers:', transformersResult.reason)
+      newErrors.transformers = 'Could not load transformers'
+    }
+
+    setErrors(newErrors)
+    setLoading(false)
   }
 
   const toggleSection = (section: keyof typeof expandedSections) => {
@@ -75,6 +92,7 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
           count={triggers.length}
           expanded={expandedSections.triggers}
           onToggle={() => toggleSection('triggers')}
+          error={errors.triggers}
         >
           {triggers.map((trigger) => (
             <PaletteItem
@@ -127,6 +145,7 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
           count={transformers.length}
           expanded={expandedSections.transforms}
           onToggle={() => toggleSection('transforms')}
+          error={errors.transformers}
         >
           {transformers.map((transformer) => (
             <PaletteItem
@@ -146,6 +165,7 @@ export function ConnectorPalette({ onAddNode }: PaletteProps) {
           count={connectors.length}
           expanded={expandedSections.connectors}
           onToggle={() => toggleSection('connectors')}
+          error={errors.connectors}
         >
           {connectors.map((connector) => (
             <PaletteItem
@@ -170,12 +190,14 @@ function Section({
   count,
   expanded,
   onToggle,
+  error,
   children,
 }: {
   title: string
   count: number
   expanded: boolean
   onToggle: () => void
+  error?: string
   children: React.ReactNode
 }) {
   return (
@@ -191,15 +213,23 @@ function Section({
             <ChevronRight className="w-4 h-4 text-gray-500" />
           )}
           <span className="font-semibold text-sm">{title}</span>
-          <span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">
-            {count}
-          </span>
+          {error ? (
+            <span className="text-xs text-red-500 bg-red-50 px-2 py-0.5 rounded-full">error</span>
+          ) : (
+            <span className="text-xs text-gray-500 bg-gray-100 px-2 py-0.5 rounded-full">
+              {count}
+            </span>
+          )}
         </div>
       </button>
-      
+
       {expanded && (
         <div className="p-2 space-y-1 border-t">
-          {children}
+          {error ? (
+            <p className="text-xs text-red-500 px-1 py-1">{error} — check the browser console for details</p>
+          ) : (
+            children
+          )}
         </div>
       )}
     </div>

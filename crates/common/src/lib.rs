@@ -366,9 +366,17 @@ pub enum FlowStep {
         #[serde(skip_serializing_if = "Option::is_none")]
         count: Option<usize>,
         
+        /// Linear steps executed each iteration (legacy / simple body)
+        #[serde(default)]
         steps: Vec<FlowStep>,
+        /// Graph-based loop body — when non-empty, nodes/edges are executed as a
+        /// sub-graph each iteration instead of `steps`.
+        #[serde(default)]
+        nodes: Vec<FlowNode>,
+        #[serde(default)]
+        edges: Vec<FlowEdge>,
         #[serde(skip_serializing_if = "Option::is_none")]
-           max_iterations: Option<usize>,
+        max_iterations: Option<usize>,
     },
 }
 

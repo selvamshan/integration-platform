@@ -8,6 +8,7 @@ export function Connectors() {
   const [connectors, setConnectors] = useState<ConnectorInstance[]>([])
   const [showCreateForm, setShowCreateForm] = useState(false)
   const [editingConnector, setEditingConnector] = useState<ConnectorInstance | null>(null)
+  const [formError, setFormError] = useState<string | null>(null)
 
   useEffect(() => {
     loadConnectors()
@@ -23,21 +24,36 @@ export function Connectors() {
   }
 
   const handleCreate = async (data: Connector) => {
-    await connectorService.create(data)
-    setShowCreateForm(false)
-    loadConnectors()
+    setFormError(null)
+    try {
+      await connectorService.create(data)
+      setShowCreateForm(false)
+      loadConnectors()
+    } catch (err: any) {
+      const data = err?.response?.data
+      const msg = data?.details ? `${data.error}: ${data.details}` : (data?.error ?? err?.message ?? 'Failed to create connector')
+      setFormError(msg)
+    }
   }
 
   const handleEdit = (connector: ConnectorInstance) => {
     setShowCreateForm(false)
+    setFormError(null)
     setEditingConnector(connector)
   }
 
   const handleUpdate = async (data: Connector) => {
     if (!editingConnector) return
-    await connectorService.update(editingConnector.id, data)
-    setEditingConnector(null)
-    loadConnectors()
+    setFormError(null)
+    try {
+      await connectorService.update(editingConnector.id, data)
+      setEditingConnector(null)
+      loadConnectors()
+    } catch (err: any) {
+      const resData = err?.response?.data
+      const msg = resData?.details ? `${resData.error}: ${resData.details}` : (resData?.error ?? err?.message ?? 'Failed to update connector')
+      setFormError(msg)
+    }
   }
 
   const handleDelete = async (id: string) => {
@@ -66,6 +82,7 @@ export function Connectors() {
       {showCreateForm && (
         <div className="card mb-6">
           <h2 className="text-xl font-bold mb-4">New Connector</h2>
+          {formError && <p className="text-sm text-red-600 mb-3">{formError}</p>}
           <ConnectorForm onSubmit={handleCreate} />
         </div>
       )}
@@ -78,6 +95,7 @@ export function Connectors() {
               Cancel
             </button>
           </div>
+          {formError && <p className="text-sm text-red-600 mb-3">{formError}</p>}
           <ConnectorForm
             onSubmit={handleUpdate}
             initialValues={editingConnector as Connector}

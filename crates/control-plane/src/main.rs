@@ -219,8 +219,9 @@ async fn main() -> Result<()> {
         .route("/audit-logs",                         get(handlers::audit::list_audit_logs))
         .route("/flows/:id/audit-logs",               get(handlers::audit::get_flow_audit_logs))
         .route("/connector-instances/:id/audit-logs", get(handlers::audit::get_connector_audit_logs))
-        // ── RBAC Middleware (comment out to disable) ──────────────────────
-        // Uncomment these lines to enable Keycloak-based RBAC:
+        // ── RBAC Middleware ───────────────────────────────────────────────
+        // Palette routes (/connectors, /triggers, /transformers) are exempt
+        // via is_public_path() in rbac.rs — no token required.
         .layer(middleware::from_fn(permission_middleware))
         .layer(middleware::from_fn_with_state(oidc.clone(), rbac_middleware))
         .layer(cors)
@@ -1058,7 +1059,7 @@ async fn list_connector_instances(
         "connector_type": c.connector_type,
         "host":           c.host,
         "port":           c.port,
-        "database":       c.database,
+        "database_name":  c.database,
         "username":       c.username,
         "active":         c.active,
         "extra_attributes": c.extra_attributes,
@@ -1085,7 +1086,7 @@ async fn get_connector_instance(
         "connector_type": instance.connector_type,
         "host":           instance.host,
         "port":           instance.port,
-        "database":       instance.database,
+        "database_name":  instance.database,
         "username":       instance.username,
         "active":         instance.active,
         "extra_attributes": instance.extra_attributes,

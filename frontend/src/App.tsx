@@ -7,6 +7,7 @@ import { Connectors } from './pages/Connectors'
 import { AuditLogs } from './pages/AuditLogs'
 import { Setup } from './pages/Setup'
 import { Users } from './pages/Users'
+import { Clients } from './pages/Clients'
 import { Layout } from './components/Layout/Layout'
 import { ProtectedRoute } from './components/Auth/ProtectedRoute'
 import { useSetupStore } from './store/setupStore'
@@ -49,6 +50,7 @@ function App() {
           <Route path="connectors" element={<Connectors />} />
           <Route path="audit-logs" element={<AuditLogs />} />
           <Route path="users" element={<Users />} />
+          <Route path="clients" element={<Clients />} />
         </Route>
       </Routes>
     </BrowserRouter>

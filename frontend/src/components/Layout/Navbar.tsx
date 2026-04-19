@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect } from 'react'
 import { Link, useNavigate } from 'react-router-dom'
-import { ChevronDown, Settings, Users, LogOut, Shield } from 'lucide-react'
+import { ChevronDown, Settings, Users, LogOut, Shield, KeyRound } from 'lucide-react'
 import { useAuthStore } from '@/store/authStore'
 import { useSetupStore } from '@/store/setupStore'
 
@@ -35,6 +35,11 @@ export function Navbar() {
   const handleManageUsers = () => {
     setAdminOpen(false)
     navigate('/users')
+  }
+
+  const handleManageClients = () => {
+    setAdminOpen(false)
+    navigate('/clients')
   }
 
   return (
@@ -79,6 +84,14 @@ export function Navbar() {
                     >
                       <Users size={15} className="text-gray-400" />
                       User Management
+                    </button>
+
+                    <button
+                      onClick={handleManageClients}
+                      className="flex w-full items-center gap-2.5 px-4 py-2.5 text-sm text-gray-700 hover:bg-gray-50"
+                    >
+                      <KeyRound size={15} className="text-gray-400" />
+                      API Clients
                     </button>
 
                     <button

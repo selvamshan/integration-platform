@@ -1,4 +1,4 @@
-use common::{Message, Result, Error, FlowDefinition, FlowStep, Connector};
+use common::{Message, Result, Error, FlowDefinition, FlowStep, FlowNode, FlowEdge, Connector};
 use std::collections::HashMap;
 use tracing::{info, error};
 use serde_json::Value;
@@ -11,7 +11,7 @@ pub mod graph_executor;
 
 pub use loop_executor::{LoopExecutor, LoopType};
 
-use loop_executor::{StepExecutor, LoopType as LT};
+use loop_executor::{StepExecutor, LoopType as LT, LoopBody};
 use templates::{resolve_templates, resolve_template_str};
 use transformers::json::TransformEngine;
 
@@ -121,7 +121,7 @@ impl FlowExecutor {
                 Ok(current)
             }
 
-            FlowStep::Loop { name, loop_mode, condition, iterate_over, count, steps, max_iterations } => {
+            FlowStep::Loop { name, loop_mode, condition, iterate_over, count, steps, nodes, edges, max_iterations } => {
                 let loop_type = match loop_mode.as_str() {
                     "while" => {
                         let cond = condition.clone()
@@ -141,10 +141,16 @@ impl FlowExecutor {
                     other => return Err(Error::Flow(format!("Loop '{}': unknown loop_mode '{}'", name, other))),
                 };
 
+                let body = if !nodes.is_empty() {
+                    LoopBody::Graph { nodes, edges }
+                } else {
+                    LoopBody::Steps(steps)
+                };
+
                 let loop_executor = LoopExecutor::new()
                     .with_max_iterations(max_iterations.unwrap_or(1000));
 
-                loop_executor.execute(name, loop_type, steps, current, self).await
+                loop_executor.execute(name, loop_type, body, current, self).await
             }
         }
     }
@@ -160,5 +166,11 @@ impl Default for FlowExecutor {
 impl StepExecutor for FlowExecutor {
     async fn run_steps(&self, steps: &[FlowStep], message: Message) -> Result<Message> {
         self.execute_steps(steps, message).await
+    }
+
+    async fn run_graph(&self, nodes: &[FlowNode], edges: &[FlowEdge], message: Message) -> Result<Message> {
+        graph_executor::execute_graph_nodes(nodes, edges, message, |node, msg| {
+            Box::pin(self.execute_step(&node.step, msg))
+        }).await
     }
 }

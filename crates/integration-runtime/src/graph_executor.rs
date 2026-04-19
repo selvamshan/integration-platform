@@ -12,18 +12,7 @@ pub enum StepOutcome {
 }
 
 /// Execute a flow using the graph (DAG) executor.
-///
-/// Algorithm:
-///   1. Build in-degree map and adjacency list from `flow.edges`.
-///   2. Seed the ready queue with nodes that have in-degree 0.
-///   3. Run each ready node, record its outcome + output message.
-///   4. For each outgoing edge, check whether the edge condition matches
-///      the node's outcome / expression.  Track how many predecessors have
-///      *fired* toward each successor; only enqueue the successor once all
-///      of its in-edges that were actually traversed have resolved (fan-in).
-///   5. Repeat until the queue is empty.
-///   6. Return the message produced by the last node to execute (or the
-///      input message if no nodes ran).
+/// Thin wrapper around [`execute_graph_nodes`] for callers that have a full [`FlowDefinition`].
 pub async fn execute_graph<'a, F, Fut>(
     flow: &'a FlowDefinition,
     input: Message,
@@ -33,30 +22,54 @@ where
     F: Fn(&'a FlowNode, Message) -> Fut,
     Fut: std::future::Future<Output = Result<Message>> + 'a,
 {
-    if flow.nodes.is_empty() {
+    execute_graph_nodes(&flow.nodes, &flow.edges, input, execute_node).await
+}
+
+/// Execute a DAG expressed as bare node and edge slices.
+///
+/// Algorithm:
+///   1. Build in-degree map and adjacency list from `edges`.
+///   2. Seed the ready queue with nodes that have in-degree 0.
+///   3. Run each ready node, record its outcome + output message.
+///   4. For each outgoing edge, check whether the edge condition matches
+///      the node's outcome / expression.  Track how many predecessors have
+///      *fired* toward each successor; only enqueue the successor once all
+///      of its in-edges that were actually traversed have resolved (fan-in).
+///   5. Repeat until the queue is empty.
+///   6. Return the message produced by the last node to execute (or the
+///      input message if no nodes ran).
+pub async fn execute_graph_nodes<'a, F, Fut>(
+    nodes: &'a [FlowNode],
+    edges: &'a [FlowEdge],
+    input: Message,
+    execute_node: F,
+) -> Result<Message>
+where
+    F: Fn(&'a FlowNode, Message) -> Fut,
+    Fut: std::future::Future<Output = Result<Message>> + 'a,
+{
+    if nodes.is_empty() {
         return Ok(input);
     }
 
     // Index nodes by id
-    let node_map: HashMap<&str, &FlowNode> = flow
-        .nodes
+    let node_map: HashMap<&str, &FlowNode> = nodes
         .iter()
         .map(|n| (n.id.as_str(), n))
         .collect();
 
     // Build adjacency list: from_id -> Vec<&FlowEdge>
     let mut outgoing: HashMap<&str, Vec<&FlowEdge>> = HashMap::new();
-    for edge in &flow.edges {
+    for edge in edges {
         outgoing.entry(edge.from.as_str()).or_default().push(edge);
     }
 
     // Compute in-degree for every node
-    let mut in_degree: HashMap<&str, usize> = flow
-        .nodes
+    let mut in_degree: HashMap<&str, usize> = nodes
         .iter()
         .map(|n| (n.id.as_str(), 0usize))
         .collect();
-    for edge in &flow.edges {
+    for edge in edges {
         *in_degree.entry(edge.to.as_str()).or_default() += 1;
     }
 
@@ -71,8 +84,7 @@ where
     let mut outcomes: HashMap<&str, StepOutcome> = HashMap::new();
 
     // Seed queue with root nodes (in-degree 0)
-    let mut queue: VecDeque<&str> = flow
-        .nodes
+    let mut queue: VecDeque<&str> = nodes
         .iter()
         .filter(|n| in_degree[n.id.as_str()] == 0)
         .map(|n| n.id.as_str())
