@@ -410,7 +410,62 @@ async fn initialize_builtin_registry(state: Arc<AppState>) -> Result<()> {
     };
     
     save_connector(&state, postgres_connector).await?;
-    
+
+    // Register MySQL connector
+    let mysql_connector = ConnectorDefinition {
+        id: "mysql-connector".to_string(),
+        name: "MySQL".to_string(),
+        connector_type: "mysql".to_string(),
+        description: "Execute SQL queries on MySQL database".to_string(),
+        icon: Some("🐬".to_string()),
+        operations: vec![
+            common::ConnectorOperation {
+                name: "query".to_string(),
+                description: "Execute SELECT query".to_string(),
+                parameters: vec![
+                    common::OperationParameter {
+                        name: "sql".to_string(),
+                        param_type: "string".to_string(),
+                        required: true,
+                        description: "SQL SELECT statement".to_string(),
+                        default_value: None,
+                    },
+                    common::OperationParameter {
+                        name: "params".to_string(),
+                        param_type: "array".to_string(),
+                        required: false,
+                        description: "Positional query parameters".to_string(),
+                        default_value: Some(json!([])),
+                    },
+                ],
+            },
+            common::ConnectorOperation {
+                name: "execute".to_string(),
+                description: "Execute INSERT/UPDATE/DELETE".to_string(),
+                parameters: vec![
+                    common::OperationParameter {
+                        name: "sql".to_string(),
+                        param_type: "string".to_string(),
+                        required: true,
+                        description: "SQL statement".to_string(),
+                        default_value: None,
+                    },
+                    common::OperationParameter {
+                        name: "params".to_string(),
+                        param_type: "array".to_string(),
+                        required: false,
+                        description: "Positional query parameters".to_string(),
+                        default_value: Some(json!([])),
+                    },
+                ],
+            },
+        ],
+        config_schema: json!({"type": "object", "properties": {"connection_string": {"type": "string"}}}),
+        enabled: true,
+    };
+
+    save_connector(&state, mysql_connector).await?;
+
     // Register HTTP trigger
     let http_trigger = TriggerDefinition {
         id: "http-trigger".to_string(),
