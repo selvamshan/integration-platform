@@ -1,14 +1,12 @@
 use anyhow::Result;
 use axum::{
     Router,
-    routing::{get, post, put, delete},
-    extract::{State, Path, Json},   
+    routing::{delete, get, post},
     http::{header, HeaderValue, Method},
-    Extension,
-    middleware
+    middleware,
 };
-use serde::Deserialize;
 use serde_json::{json, Value};
+use axum::Json;
 use std::sync::Arc;
 use std::collections::HashMap;
 use tokio::sync::RwLock;
@@ -16,22 +14,7 @@ use tower_http::trace::TraceLayer;
 use tower_http::cors::CorsLayer;
 use tower_http::catch_panic::CatchPanicLayer;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
-use sqlx::{PgPool, postgres::PgPoolOptions, Row};
-use async_nats::Client as NatsClient;
-use futures::StreamExt;
-use jsonwebtoken::{encode, Header, EncodingKey};
-
-use common::{
-    ApiDefinition, 
-    FlowDefinition, 
-    Endpoint, 
-    ConfigUpdate, 
-    ConnectorDefinition, 
-    TriggerDefinition,   
-    RateLimitEvent,
-    JwtClaims,
-};
-
+use sqlx::postgres::PgPoolOptions;
 
 mod state;
 mod error;
@@ -43,25 +26,37 @@ mod transformers;
 mod handlers;
 mod audit;
 mod db_migrations;
-use error::AppError;
+mod services;
+mod startup;
+
 use crypto::CryptoService;
 use oidc::OidcAuth;
 use rbac::{permission_middleware, rbac_middleware};
 use audit::AuditLogger;
-use handlers::flow::{list_flows, 
-    test_flow, 
-    get_flow, 
-    create_flow, 
-    delete_flow, 
-    update_flow,
-    publish_event
-};
 use state::AppState;
 use db_migrations::run_migrations;
 
+use handlers::api::{list_apis, create_api, get_api};
+use handlers::connector::{list_connectors, get_connector, list_triggers, get_trigger};
+use handlers::connector_instance::{
+    create_connector_instance, list_connector_instances, get_connector_instance,
+    list_connector_instances_by_type, test_connector_instance,
+    delete_connector_instance, update_connector_instance,
+};
+use handlers::auth::{create_client, list_clients, get_client, delete_client, toggle_client, issue_token};
+use handlers::user::{invite_user, list_users, delete_user, get_current_user};
+use handlers::rate_limit::{get_rate_limit_stats, get_flow_rate_limit_stats};
+use handlers::flow::{list_flows, test_flow, get_flow, create_flow, delete_flow, update_flow};
 
-//type RedisConnection = redis::aio::ConnectionManager;
+use services::flow_sync::flow_sync_service;
+use services::connector_sync::connector_instance_sync_service;
+use services::rate_limit_listener::rate_limit_event_listener;
+use services::credential_validation::credential_validation_service;
 
+use startup::{
+    load_flows_from_database, load_apis_from_database,
+    load_connector_instances, initialize_builtin_registry,
+};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -75,14 +70,12 @@ async fn main() -> Result<()> {
 
     let database_url = std::env::var("DATABASE_URL")
         .unwrap_or_else(|_| "postgresql://platform:platform123@postgres:5432/integration_platform".to_string());
-    
+
     let db = PgPoolOptions::new().max_connections(10).connect(&database_url).await?;
     tracing::info!("✅ Database connected");
 
-    // Connect to Redis
     let redis_url = std::env::var("REDIS_URL")
         .unwrap_or_else(|_| "redis://redis:6379".to_string());
-    
     tracing::info!("Connecting to Redis at {}...", redis_url);
     let redis_client = redis::Client::open(redis_url)?;
     let redis = redis::aio::ConnectionManager::new(redis_client).await?;
@@ -94,25 +87,24 @@ async fn main() -> Result<()> {
 
     let jwt_secret = std::env::var("JWT_SECRET")
         .unwrap_or_else(|_| "integration-platform-secret-change-in-production".to_string());
-    
+
     let crypto = Arc::new(CryptoService::new()?);
     tracing::info!("✅ Encryption service initialized");
 
-    // Initialize OIDC provider (Keycloak / Auth0 / Okta via OIDC_PROVIDER env var)
     let oidc = Arc::new(OidcAuth::from_env());
 
     run_migrations(&db).await?;
-    
+
     let state = Arc::new(AppState {
         db: db.clone(),
         nats,
         redis,
-        apis: Arc::new(RwLock::new(Vec::new())),
-        flows: Arc::new(RwLock::new(Vec::new())),
-        connectors: Arc::new(RwLock::new(Vec::new())),
-        triggers: Arc::new(RwLock::new(Vec::new())),
+        apis:                Arc::new(RwLock::new(Vec::new())),
+        flows:               Arc::new(RwLock::new(Vec::new())),
+        connectors:          Arc::new(RwLock::new(Vec::new())),
+        triggers:            Arc::new(RwLock::new(Vec::new())),
         connector_instances: Arc::new(RwLock::new(Vec::new())),
-        rate_limit_stats: Arc::new(RwLock::new(HashMap::new())),
+        rate_limit_stats:    Arc::new(RwLock::new(HashMap::new())),
         jwt_secret,
         crypto,
         oidc: oidc.clone(),
@@ -124,7 +116,6 @@ async fn main() -> Result<()> {
     load_connector_instances(&state).await?;
     initialize_builtin_registry(state.clone()).await?;
 
-   // Start flow sync service - listens for Data Plane registration
     let sync_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = flow_sync_service(sync_state).await {
@@ -132,7 +123,6 @@ async fn main() -> Result<()> {
         }
     });
 
-     // Background: push connector instances to newly registered data-planes
     let connector_sync_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = connector_instance_sync_service(connector_sync_state).await {
@@ -140,8 +130,6 @@ async fn main() -> Result<()> {
         }
     });
 
-
-    // Start rate limit event listener
     let ratelimit_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = rate_limit_event_listener(ratelimit_state).await {
@@ -149,7 +137,6 @@ async fn main() -> Result<()> {
         }
     });
 
-    // Background: validate client credentials for data-planes (NATS request-reply)
     let cred_state = state.clone();
     tokio::spawn(async move {
         if let Err(e) = credential_validation_service(cred_state).await {
@@ -158,71 +145,58 @@ async fn main() -> Result<()> {
     });
 
     let cors = CorsLayer::new()
-    .allow_origin(
-        "http://localhost:3000"
-            .parse::<HeaderValue>()
-            .unwrap(),
-    )
-    .allow_methods([
-        Method::GET,
-        Method::POST,
-        Method::PUT,
-        Method::DELETE,
-        Method::OPTIONS, // 🔥 REQUIRED
-    ])
-    // 🔥 FIX: Replace 'Any' with an explicit list
-    .allow_headers([
-        header::AUTHORIZATION,
-        header::CONTENT_TYPE,
-        header::ACCEPT,
-        header::X_CONTENT_TYPE_OPTIONS, // Common for some AJAX libs
-    ])
-    .allow_credentials(true);
+        .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::ACCEPT,
+            header::X_CONTENT_TYPE_OPTIONS,
+        ])
+        .allow_credentials(true);
 
     let app = Router::new()
-        .route("/", get(root))
+        .route("/",       get(root))
         .route("/health", get(health_check))
         // API routes
-        .route("/apis", get(list_apis).post(create_api))
+        .route("/apis",     get(list_apis).post(create_api))
         .route("/apis/:id", get(get_api))
         // Flow routes
-        .route("/flows", get(list_flows).post(create_flow))
+        .route("/flows",     get(list_flows).post(create_flow))
         .route("/flows/:id", get(get_flow).put(update_flow).delete(delete_flow))
         .route("/flows/test", post(test_flow))
-        //Transformers
-        .route("/transformers",     get(transformers::list_transformers))
-        .route("/transformers/:id", get(transformers::get_transformer))
+        // Transformer routes
+        .route("/transformers",              get(transformers::list_transformers))
+        .route("/transformers/:id",          get(transformers::get_transformer))
         .route("/transformers/capabilities", get(transformers::get_transformer_capabilities))
-        // Connector registry routes (for UI palette)
-        .route("/connectors", get(list_connectors))
+        // Connector registry routes
+        .route("/connectors",     get(list_connectors))
         .route("/connectors/:id", get(get_connector))
-        // Trigger registry routes (for UI palette)
-        .route("/triggers", get(list_triggers))        
+        // Trigger registry routes
+        .route("/triggers",     get(list_triggers))
         .route("/triggers/:id", get(get_trigger))
-        // ── Rate-limit stats ──────────────────────────────────────────────
-        .route("/rate-limits", get(get_rate_limit_stats))
+        // Rate-limit stats
+        .route("/rate-limits",          get(get_rate_limit_stats))
         .route("/rate-limits/:flow_id", get(get_flow_rate_limit_stats))
-        // ── Auth: client management & token issuance ──────────────────────
-        .route("/auth/clients",           post(create_client).get(list_clients))
-        .route("/auth/clients/:client_id",get(get_client).delete(delete_client).patch(toggle_client))
-        .route("/auth/token",             post(issue_token))
-         // ── Connector Instances ────────────────────────────────────────────
-        .route("/connector-instances",          post(create_connector_instance).get(list_connector_instances))
-        .route("/connector-instances/test",     post(test_connector_instance))
-        .route("/connector-instances/:id",      get(get_connector_instance).put(update_connector_instance).delete(delete_connector_instance))
-        .route("/connector-instances/type/:connector_type", get(list_connector_instances_by_type))
-          // ── User Management (RBAC) ─────────────────────────────────────────
-        .route("/users/invite",       post(invite_user))
-        .route("/users",              get(list_users))
-        .route("/users/me",           get(get_current_user))
-        .route("/users/:user_id",     delete(delete_user))
-        // ── Audit Logs ────────────────────────────────────────────────────
+        // Auth: client management & token issuance
+        .route("/auth/clients",              post(create_client).get(list_clients))
+        .route("/auth/clients/:client_id",   get(get_client).delete(delete_client).patch(toggle_client))
+        .route("/auth/token",                post(issue_token))
+        // Connector instances
+        .route("/connector-instances",                          post(create_connector_instance).get(list_connector_instances))
+        .route("/connector-instances/test",                     post(test_connector_instance))
+        .route("/connector-instances/:id",                      get(get_connector_instance).put(update_connector_instance).delete(delete_connector_instance))
+        .route("/connector-instances/type/:connector_type",     get(list_connector_instances_by_type))
+        // User management
+        .route("/users/invite",   post(invite_user))
+        .route("/users",          get(list_users))
+        .route("/users/me",       get(get_current_user))
+        .route("/users/:user_id", delete(delete_user))
+        // Audit logs
         .route("/audit-logs",                         get(handlers::audit::list_audit_logs))
         .route("/flows/:id/audit-logs",               get(handlers::audit::get_flow_audit_logs))
         .route("/connector-instances/:id/audit-logs", get(handlers::audit::get_connector_audit_logs))
-        // ── RBAC Middleware ───────────────────────────────────────────────
-        // Palette routes (/connectors, /triggers, /transformers) are exempt
-        // via is_public_path() in rbac.rs — no token required.
+        // Middleware
         .layer(middleware::from_fn(permission_middleware))
         .layer(middleware::from_fn_with_state(oidc.clone(), rbac_middleware))
         .layer(cors)
@@ -238,1314 +212,14 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn load_flows_from_database(state: Arc<AppState>) -> Result<()> {
-    tracing::info!("📥 Loading flows from database into memory...");
-    
-    let rows = sqlx::query("SELECT config FROM flow_definitions")
-        .fetch_all(&state.db)
-        .await?;
-    
-    let mut flows = state.flows.write().await;
-    
-    for row in rows {
-        let config: serde_json::Value = row.try_get("config")?;
-        if let Ok(flow) = serde_json::from_value::<FlowDefinition>(config) {
-            tracing::info!("  ➕ Loaded: {} ({})", flow.name, flow.id);
-            flows.push(flow);
-        }
-    }
-    
-    tracing::info!("✅ Loaded {} flows into memory", flows.len());
-    Ok(())
-}
-
-async fn load_apis_from_database(state: Arc<AppState>) -> Result<()> {
-    tracing::info!("📥 Loading API definitions from database into memory...");
-
-    let rows = sqlx::query("SELECT config FROM api_definitions")
-        .fetch_all(&state.db)
-        .await?;
-
-    let mut apis = state.apis.write().await;
-
-    for row in rows {
-        let config: serde_json::Value = row.try_get("config")?;
-        if let Ok(api) = serde_json::from_value::<ApiDefinition>(config) {
-            tracing::info!("  ➕ Loaded API: {} v{}", api.name, api.version);
-            apis.push(api);
-        }
-    }
-
-    tracing::info!("✅ Loaded {} API definitions into memory", apis.len());
-    Ok(())
-}
-
-// Flow Sync Service - listens for Data Plane registration and pushes all flows
-async fn flow_sync_service(state: Arc<AppState>) -> Result<()> {
-    tracing::info!("🔄 Starting Flow Sync Service...");
-    
-    // Subscribe to data plane registration requests
-    let mut subscriber = state.nats.subscribe("dataplane.register").await?;
-    
-    tracing::info!("✅ Flow Sync Service listening for Data Plane registrations");
-    
-    while let Some(message) = subscriber.next().await {
-        let node_id = String::from_utf8_lossy(&message.payload).to_string();
-        
-        tracing::info!("📡 Data Plane registered: {}", node_id);
-        tracing::info!("📤 Pushing all flows to Data Plane: {}", node_id);
-        
-        // Get all flows
-        let flows = state.flows.read().await;
-        let flow_count = flows.len();
-        
-        // Push each flow to the Data Plane
-        for flow in flows.iter() {
-            let event = ConfigUpdate::FlowCreated { flow: flow.clone() };
-            if let Err(e) = publish_event(&state.nats, &event).await {
-                tracing::error!("Failed to push flow {}: {}", flow.id, e);
-            } else {
-                tracing::debug!("  ✅ Pushed: {} ({})", flow.name, flow.id);
-            }
-            
-            // Small delay to avoid overwhelming the Data Plane
-            tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
-        }
-        
-        tracing::info!("✅ Successfully pushed {} flows to Data Plane: {}", flow_count, node_id);
-    }
-    
-    Ok(())
-}
-
-
-async fn initialize_builtin_registry(state: Arc<AppState>) -> Result<()> {
-    tracing::info!("📋 Initializing built-in connectors and triggers...");
-    
-    // Register HTTP connector
-    let http_connector = ConnectorDefinition {
-        id: "http-connector".to_string(),
-        name: "HTTP/REST".to_string(),
-        connector_type: "http".to_string(),
-        description: "Make HTTP GET/POST requests to external APIs".to_string(),
-        icon: Some("🌐".to_string()),
-        operations: vec![
-            common::ConnectorOperation {
-                name: "get".to_string(),
-                description: "Make HTTP GET request".to_string(),
-                parameters: vec![
-                    common::OperationParameter {
-                        name: "url".to_string(),
-                        param_type: "string".to_string(),
-                        required: true,
-                        description: "Target URL".to_string(),
-                        default_value: None,
-                    },
-                ],
-            },
-            common::ConnectorOperation {
-                name: "post".to_string(),
-                description: "Make HTTP POST request".to_string(),
-                parameters: vec![
-                    common::OperationParameter {
-                        name: "url".to_string(),
-                        param_type: "string".to_string(),
-                        required: true,
-                        description: "Target URL".to_string(),
-                        default_value: None,
-                    },
-                    common::OperationParameter {
-                        name: "body".to_string(),
-                        param_type: "object".to_string(),
-                        required: false,
-                        description: "Request body (JSON)".to_string(),
-                        default_value: Some(json!({})),
-                    },
-                ],
-            },
-        ],
-        config_schema: json!({"type": "object", "properties": {}}),
-        enabled: true,
-    };
-    
-    save_connector(&state, http_connector).await?;
-    
-    // Register PostgreSQL connector
-    let postgres_connector = ConnectorDefinition {
-        id: "postgres-connector".to_string(),
-        name: "PostgreSQL".to_string(),
-        connector_type: "postgres".to_string(),
-        description: "Execute SQL queries on PostgreSQL database".to_string(),
-        icon: Some("🐘".to_string()),
-        operations: vec![
-            common::ConnectorOperation {
-                name: "query".to_string(),
-                description: "Execute SELECT query".to_string(),
-                parameters: vec![
-                    common::OperationParameter {
-                        name: "sql".to_string(),
-                        param_type: "string".to_string(),
-                        required: true,
-                        description: "SQL SELECT statement".to_string(),
-                        default_value: None,
-                    },
-                ],
-            },
-            common::ConnectorOperation {
-                name: "execute".to_string(),
-                description: "Execute INSERT/UPDATE/DELETE".to_string(),
-                parameters: vec![
-                    common::OperationParameter {
-                        name: "sql".to_string(),
-                        param_type: "string".to_string(),
-                        required: true,
-                        description: "SQL statement".to_string(),
-                        default_value: None,
-                    },
-                ],
-            },
-        ],
-        config_schema: json!({"type": "object", "properties": {"connection_string": {"type": "string"}}}),
-        enabled: true,
-    };
-    
-    save_connector(&state, postgres_connector).await?;
-
-    // Register MySQL connector
-    let mysql_connector = ConnectorDefinition {
-        id: "mysql-connector".to_string(),
-        name: "MySQL".to_string(),
-        connector_type: "mysql".to_string(),
-        description: "Execute SQL queries on MySQL database".to_string(),
-        icon: Some("🐬".to_string()),
-        operations: vec![
-            common::ConnectorOperation {
-                name: "query".to_string(),
-                description: "Execute SELECT query".to_string(),
-                parameters: vec![
-                    common::OperationParameter {
-                        name: "sql".to_string(),
-                        param_type: "string".to_string(),
-                        required: true,
-                        description: "SQL SELECT statement".to_string(),
-                        default_value: None,
-                    },
-                    common::OperationParameter {
-                        name: "params".to_string(),
-                        param_type: "array".to_string(),
-                        required: false,
-                        description: "Positional query parameters".to_string(),
-                        default_value: Some(json!([])),
-                    },
-                ],
-            },
-            common::ConnectorOperation {
-                name: "execute".to_string(),
-                description: "Execute INSERT/UPDATE/DELETE".to_string(),
-                parameters: vec![
-                    common::OperationParameter {
-                        name: "sql".to_string(),
-                        param_type: "string".to_string(),
-                        required: true,
-                        description: "SQL statement".to_string(),
-                        default_value: None,
-                    },
-                    common::OperationParameter {
-                        name: "params".to_string(),
-                        param_type: "array".to_string(),
-                        required: false,
-                        description: "Positional query parameters".to_string(),
-                        default_value: Some(json!([])),
-                    },
-                ],
-            },
-        ],
-        config_schema: json!({"type": "object", "properties": {"connection_string": {"type": "string"}}}),
-        enabled: true,
-    };
-
-    save_connector(&state, mysql_connector).await?;
-
-    // Register HTTP trigger
-    let http_trigger = TriggerDefinition {
-        id: "http-trigger".to_string(),
-        name: "HTTP Request".to_string(),
-        trigger_type: "http".to_string(),
-        description: "Trigger flow on HTTP GET/POST request".to_string(),
-        icon: Some("🌐".to_string()),
-        config_schema: json!({
-            "type": "object",
-            "properties": {
-                "path": {"type": "string", "description": "URL path"},
-                "method": {"type": "string", "enum": ["GET", "POST", "PUT", "DELETE"]}
-            },
-            "required": ["path", "method"]
-        }),
-        enabled: true,
-    };
-    
-    save_trigger(&state, http_trigger).await?;
-    
-    // Register Schedule trigger
-    let schedule_trigger = TriggerDefinition {
-        id: "schedule-trigger".to_string(),
-        name: "Schedule".to_string(),
-        trigger_type: "schedule".to_string(),
-        description: "Trigger flow on schedule (cron)".to_string(),
-        icon: Some("⏰".to_string()),
-        config_schema: json!({
-            "type": "object",
-            "properties": {
-                "cron": {"type": "string", "description": "Cron expression"}
-            },
-            "required": ["cron"]
-        }),
-        enabled: true,
-    };
-    
-    save_trigger(&state, schedule_trigger).await?;
-    
-    tracing::info!("✅ Built-in registry initialized");
-    Ok(())
-}
-
-async fn save_connector(state: &AppState, connector: ConnectorDefinition) -> Result<()> { 
-    sqlx::query("INSERT INTO connector_definitions (name, connector_type, config) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING")
-        .bind(&connector.name)
-        .bind(&connector.connector_type)
-        .bind(serde_json::to_value(&connector)?)
-        .execute(&state.db)
-        .await?;
-    
-    let mut connectors = state.connectors.write().await;
-    if !connectors.iter().any(|c| c.id == connector.id) {
-        connectors.push(connector.clone());
-    }
-    Ok(())
-}
-
-async fn save_trigger(state: &AppState, trigger: TriggerDefinition) -> Result<()> {
-
-    sqlx::query("INSERT INTO trigger_definitions (name, trigger_type, config) VALUES ($1, $2, $3) ON CONFLICT (name) DO NOTHING")
-        .bind(&trigger.name)
-        .bind(&trigger.trigger_type)
-        .bind(serde_json::to_value(&trigger)?)
-        .execute(&state.db)
-        .await?;
-    
-    let mut triggers = state.triggers.write().await;
-    if !triggers.iter().any(|t| t.id == trigger.id) {
-        triggers.push(trigger.clone());
-    }
-    Ok(())
-}
-
 async fn root() -> &'static str {
     "Control Plane - Integration Platform with Registry"
 }
 
 async fn health_check() -> Json<Value> {
-    Json(json!({"status": "healthy", "service": "control-plane", "timestamp": chrono::Utc::now().to_rfc3339()}))
-}
-
-// Connector Registry endpoints
-async fn list_connectors(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let connectors = state.connectors.read().await;
-    Json(json!({"connectors": *connectors, "count": connectors.len()}))
-}
-
-async fn get_connector(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
-    let connectors = state.connectors.read().await;
-    let connector = connectors.iter().find(|c| c.id == id).ok_or_else(|| AppError::NotFound("Connector not found".to_string()))?;
-    Ok(Json(json!(connector)))
-}
-
-// Trigger Registry endpoints
-async fn list_triggers(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let triggers = state.triggers.read().await;
-    Json(json!({"triggers": *triggers, "count": triggers.len()}))
-}
-
-async fn get_trigger(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
-    let triggers = state.triggers.read().await;
-    let trigger = triggers.iter().find(|t| t.id == id).ok_or_else(|| AppError::NotFound("Trigger not found".to_string()))?;
-    Ok(Json(json!(trigger)))
-}
-
-// API endpoints
-async fn list_apis(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let apis = state.apis.read().await;
-    Json(json!({"apis": *apis, "count": apis.len()}))
-}
-
-#[derive(Deserialize)]
-struct CreateApiRequest {
-    name: String,
-    version: String,
-    base_path: String,
-    endpoints: Vec<EndpointRequest>,
-}
-
-#[derive(Deserialize)]
-struct EndpointRequest {
-    path: String,
-    method: String,
-    flow_id: String,
-}
-
-async fn create_api(State(state): State<Arc<AppState>>, Json(req): Json<CreateApiRequest>) -> Result<Json<Value>, AppError> {
-    tracing::info!("📡 Creating API: {} v{}", req.name, req.version);
-    
-    let api_id = uuid::Uuid::new_v4().to_string();
-    let api = ApiDefinition {
-        id: api_id.clone(),
-        name: req.name,
-        version: req.version,
-        base_path: req.base_path,
-        endpoints: req.endpoints.into_iter().map(|e| Endpoint {
-            path: e.path,
-            method: e.method,
-            flow_id: e.flow_id,
-        }).collect(),
-    };
-    
-    sqlx::query("INSERT INTO api_definitions (id, name, version, base_path, config) VALUES ($1, $2, $3, $4, $5)")
-        .bind(uuid::Uuid::parse_str(&api.id).unwrap())
-        .bind(&api.name)
-        .bind(&api.version)
-        .bind(&api.base_path)
-        .bind(serde_json::to_value(&api).unwrap())
-        .execute(&state.db)
-        .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
-    let mut apis = state.apis.write().await;
-    apis.push(api.clone());
-    drop(apis);
-    
-    let event = ConfigUpdate::ApiCreated { api: api.clone() };
-    publish_event(&state.nats, &event).await?;
-    
-    tracing::info!("✅ API created: {}", api_id);
-    Ok(Json(json!(api)))
-}
-
-async fn get_api(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
-    let apis = state.apis.read().await;
-    let api = apis.iter().find(|a| a.id == id).ok_or_else(|| AppError::NotFound("API not found".to_string()))?;
-    Ok(Json(json!(api)))
-}
-
-
-// ─── Connector Instance Sync Service ─────────────────────────────────────────
-
-/// Push all connector instances to newly-registered data-planes
-async fn connector_instance_sync_service(state: Arc<AppState>) -> Result<()> {
-    let mut subscriber = state.nats.subscribe("dataplane.register").await?;
-    tracing::info!("🔄 Connector instance sync: listening for data-plane registrations");
-
-    while let Some(msg) = subscriber.next().await {
-        let node_id = String::from_utf8_lossy(&msg.payload).to_string();
-        tracing::info!("📡 Data-plane registered: {}, syncing connector instances...", node_id);
-
-        let instances = state.connector_instances.read().await.clone();
-        for instance in &instances {
-            let event = common::ConnectorInstanceEvent::Created {
-                instance: instance.clone(),
-            };
-            
-            let payload = match serde_json::to_vec(&event) {
-                Ok(p) => p,
-                Err(e) => {
-                    tracing::error!("Failed to serialize connector instance {}: {}", instance.id, e);
-                    continue;
-                }
-            };
-
-            if let Err(e) = state.nats.publish(event.subject(), payload.into()).await {
-                tracing::error!("Failed to push connector instance {}: {}", instance.id, e);
-            }
-        }
-        
-        tracing::info!("✅ Pushed {} connector instances to {}", instances.len(), node_id);
-    }
-
-    Ok(())
-}
-
-// Rate limit event listener
-async fn rate_limit_event_listener(state: Arc<AppState>) -> Result<()> {
-    tracing::info!("📊 Starting Rate Limit Event Listener...");
-    
-    let mut subscriber = state.nats.subscribe("ratelimit.event").await?;
-    
-    tracing::info!("✅ Subscribed to ratelimit.event");
-    
-    while let Some(message) = subscriber.next().await {
-        match serde_json::from_slice::<RateLimitEvent>(&message.payload) {
-            Ok(event) => {
-                if !event.allowed {
-                    tracing::warn!(
-                        "🚫 Rate limit exceeded: flow={}, key={}, count={}/{}", 
-                        event.flow_id, event.key, event.current_count, event.limit
-                    );
-                } else {
-                    tracing::debug!(
-                        "✅ Rate limit check: flow={}, count={}/{}", 
-                        event.flow_id, event.current_count, event.limit
-                    );
-                }
-                
-                // Store event for statistics (keep last 1000 per flow)
-                let mut stats = state.rate_limit_stats.write().await;
-                let flow_events = stats.entry(event.flow_id.clone()).or_insert_with(Vec::new);
-                flow_events.push(event);
-                
-                // Keep only last 1000 events per flow
-                if flow_events.len() > 1000 {
-                    flow_events.drain(0..flow_events.len() - 1000);
-                }
-            }
-            Err(e) => {
-                tracing::error!("Failed to deserialize rate limit event: {}", e);
-            }
-        }
-    }
-    
-    Ok(())
-}
-
-// Get all rate limit statistics
-async fn get_rate_limit_stats(State(state): State<Arc<AppState>>) -> Json<Value> {
-    let stats = state.rate_limit_stats.read().await;
-    
-    let mut summary = serde_json::Map::new();
-    
-    for (flow_id, events) in stats.iter() {
-        let total = events.len();
-        let blocked = events.iter().filter(|e| !e.allowed).count();
-        let allowed = events.iter().filter(|e| e.allowed).count();
-        
-        summary.insert(flow_id.clone(), json!({
-            "total_requests": total,
-            "allowed": allowed,
-            "blocked": blocked,
-            "block_rate": if total > 0 { (blocked as f64 / total as f64 * 100.0) } else { 0.0 }
-        }));
-    }
-    
     Json(json!({
-        "flows": summary,
+        "status":    "healthy",
+        "service":   "control-plane",
         "timestamp": chrono::Utc::now().to_rfc3339()
     }))
-}
-
-// Get rate limit statistics for specific flow
-async fn get_flow_rate_limit_stats(
-    State(state): State<Arc<AppState>>,
-    Path(flow_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    let stats = state.rate_limit_stats.read().await;
-    
-    let events = stats.get(&flow_id)
-        .ok_or_else(|| AppError::NotFound(format!("No rate limit stats for flow: {}", flow_id)))?;
-    
-    let total = events.len();
-    let blocked = events.iter().filter(|e| !e.allowed).count();
-    let allowed = events.iter().filter(|e| e.allowed).count();
-    
-    // Get last 10 events
-    let recent_events: Vec<&RateLimitEvent> = events.iter()
-        .rev()
-        .take(10)
-        .collect();
-    
-    // Group by key to see which keys are hitting limits
-    let mut key_stats = std::collections::HashMap::new();
-    for event in events {
-        let entry = key_stats.entry(event.key.clone()).or_insert((0, 0));
-        if event.allowed {
-            entry.0 += 1;
-        } else {
-            entry.1 += 1;
-        }
-    }
-    
-    Ok(Json(json!({
-        "flow_id": flow_id,
-        "summary": {
-            "total_requests": total,
-            "allowed": allowed,
-            "blocked": blocked,
-            "block_rate": if total > 0 { (blocked as f64 / total as f64 * 100.0) } else { 0.0 }
-        },
-        "by_key": key_stats.iter().map(|(k, (a, b))| {
-            json!({
-                "key": k,
-                "allowed": a,
-                "blocked": b
-            })
-        }).collect::<Vec<_>>(),
-        "recent_events": recent_events,
-        "timestamp": chrono::Utc::now().to_rfc3339()
-    })))
-}
-
-
-// ─── Credential validation service (NATS request-reply) ──────────────────────
-
-async fn credential_validation_service(state: Arc<AppState>) -> Result<()> {
-    let mut subscriber = state.nats.subscribe("auth.validate.credentials").await?;
-    tracing::info!("🔐 Credential validation service started");
-
-    while let Some(msg) = subscriber.next().await {
-        let reply = match msg.reply { Some(r) => r, None => continue };
-
-        let response = match do_validate_credentials(&state, &msg.payload).await {
-            Ok(p) => {
-                tracing::debug!("✅ Credential OK: {}", p.client_id);
-                json!({ "valid": true, "client_id": p.client_id, "name": p.client_name })
-            }
-            Err(reason) => {
-                tracing::warn!("❌ Credential rejected: {}", reason);
-                json!({ "valid": false, "reason": reason })
-            }
-        };
-
-        let _ = state.nats.publish(reply, serde_json::to_vec(&response).unwrap_or_default().into()).await;
-    }
-    Ok(())
-}
-
-async fn do_validate_credentials(
-    state: &AppState,
-    payload: &[u8],
-) -> std::result::Result<common::AuthPrincipal, String> {
-    #[derive(Deserialize)]
-    struct Req { client_id: String, client_secret: String }
-
-    let req: Req = serde_json::from_slice(payload).map_err(|_| "Malformed request".to_string())?;
-
-    let row = sqlx::query!(
-        "SELECT client_id, client_secret_hash, name, active, expires_at
-         FROM client_credentials WHERE client_id = $1", req.client_id
-    )
-    .fetch_optional(&state.db).await.map_err(|e| e.to_string())?
-    .ok_or_else(|| "Client not found".to_string())?;
-
-    if !row.active { return Err("Client is deactivated".into()); }
-    if let Some(exp) = row.expires_at {
-        if exp < chrono::Utc::now() { return Err("Credential expired".into()); }
-    }
-    if !bcrypt::verify(&req.client_secret, &row.client_secret_hash).map_err(|e| e.to_string())? {
-        return Err("Invalid secret".into());
-    }
-
-    Ok(common::AuthPrincipal {
-        client_id:   row.client_id,
-        client_name: row.name,
-        auth_method: common::AuthMethod::ClientCredentials,
-    })
-}
-
-// ─── Auth: client CRUD ────────────────────────────────────────────────────────
-
-#[derive(Deserialize)]
-struct CreateClientBody {
-    name: String,
-    expires_in_days: Option<i64>,
-}
-
-/// POST /auth/clients — create credentials; plain secret returned once
-async fn create_client(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateClientBody>,
-) -> Result<Json<Value>, AppError> {
-    let client_id  = format!("cid_{}", uuid::Uuid::new_v4().simple());
-    let raw_secret = format!("cs_{}", uuid::Uuid::new_v4().simple());
-    let hash = bcrypt::hash(&raw_secret, bcrypt::DEFAULT_COST)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let expires_at: Option<chrono::DateTime<chrono::Utc>> =
-        body.expires_in_days.map(|d| chrono::Utc::now() + chrono::Duration::days(d));
-
-    sqlx::query!(
-        "INSERT INTO client_credentials (client_id, client_secret_hash, name, active, expires_at)
-         VALUES ($1, $2, $3, TRUE, $4)",
-        client_id, hash, body.name, expires_at
-    )
-    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-    tracing::info!("🔑 Created client: {} ({})", body.name, client_id);
-
-    Ok(Json(json!({
-        "client_id":     client_id,
-        "client_secret": raw_secret,   // shown ONCE — store securely
-        "name":          body.name,
-        "active":        true,
-        "expires_at":    expires_at,
-        "warning":       "Store client_secret now — it will not be shown again"
-    })))
-}
-
-/// GET /auth/clients
-async fn list_clients(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, AppError> {
-    let rows = sqlx::query!(
-        "SELECT client_id, name, active, created_at, expires_at
-         FROM client_credentials ORDER BY created_at DESC"
-    )
-    .fetch_all(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let clients: Vec<Value> = rows.iter().map(|r| json!({
-        "client_id":  r.client_id,
-        "name":       r.name,
-        "active":     r.active,
-        "created_at": r.created_at,
-        "expires_at": r.expires_at,
-    })).collect();
-
-    Ok(Json(json!({ "clients": clients, "count": clients.len() })))
-}
-
-/// GET /auth/clients/:client_id
-async fn get_client(
-    State(state): State<Arc<AppState>>,
-    Path(client_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    let row = sqlx::query!(
-        "SELECT client_id, name, active, created_at, expires_at
-         FROM client_credentials WHERE client_id = $1", client_id
-    )
-    .fetch_optional(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?
-    .ok_or_else(|| AppError::NotFound(format!("Client not found: {}", client_id)))?;
-
-    Ok(Json(json!({
-        "client_id":  row.client_id,
-        "name":       row.name,
-        "active":     row.active,
-        "created_at": row.created_at,
-        "expires_at": row.expires_at,
-    })))
-}
-
-/// DELETE /auth/clients/:client_id
-async fn delete_client(
-    State(state): State<Arc<AppState>>,
-    Path(client_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    let res = sqlx::query!(
-        "DELETE FROM client_credentials WHERE client_id = $1", client_id
-    )
-    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-    if res.rows_affected() == 0 {
-        return Err(AppError::NotFound(format!("Client not found: {}", client_id)));
-    }
-    tracing::info!("🗑️  Deleted client: {}", client_id);
-    Ok(Json(json!({ "deleted": client_id })))
-}
-
-/// PATCH /auth/clients/:client_id — activate or deactivate
-#[derive(Deserialize)]
-struct ToggleBody { active: bool }
-
-async fn toggle_client(
-    State(state): State<Arc<AppState>>,
-    Path(client_id): Path<String>,
-    Json(body): Json<ToggleBody>,
-) -> Result<Json<Value>, AppError> {
-    let res = sqlx::query!(
-        "UPDATE client_credentials SET active = $1 WHERE client_id = $2",
-        body.active, client_id
-    )
-    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-    if res.rows_affected() == 0 {
-        return Err(AppError::NotFound(format!("Client not found: {}", client_id)));
-    }
-    let status = if body.active { "activated" } else { "deactivated" };
-    tracing::info!("🔄 Client {} {}", client_id, status);
-    Ok(Json(json!({ "client_id": client_id, "active": body.active })))
-}
-
-// ─── Auth: token issuance ─────────────────────────────────────────────────────
-
-const TOKEN_EXPIRY_SECS: i64 = 3600; // 1 hour
-
-/// POST /auth/token — exchange client_id + secret for a signed JWT
-async fn issue_token(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<common::TokenRequest>,
-) -> Result<Json<Value>, AppError> {
-    // 1. Fetch record
-    let row = sqlx::query!(
-        "SELECT client_id, client_secret_hash, name, active, expires_at
-         FROM client_credentials WHERE client_id = $1", body.client_id
-    )
-    .fetch_optional(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?
-    .ok_or_else(|| AppError::Unauthorized("Invalid credentials".into()))?;
-
-    // 2. Active check
-    if !row.active {
-        return Err(AppError::Unauthorized("Client is deactivated".into()));
-    }
-
-    // 3. Expiry check
-    if let Some(exp) = row.expires_at {
-        if exp < chrono::Utc::now() {
-            return Err(AppError::Unauthorized("Credential has expired".into()));
-        }
-    }
-
-    // 4. Secret verification
-    let ok = bcrypt::verify(&body.client_secret, &row.client_secret_hash)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    if !ok {
-        return Err(AppError::Unauthorized("Invalid credentials".into()));
-    }
-
-    // 5. Sign JWT
-    let now = chrono::Utc::now().timestamp();
-    let claims = JwtClaims {
-        sub:         row.client_id.clone(),
-        client_name: row.name.clone(),
-        iat:         now,
-        exp:         now + TOKEN_EXPIRY_SECS,
-        jti:         uuid::Uuid::new_v4().to_string(),
-    };
-    let token = encode(
-        &Header::default(),
-        &claims,
-        &EncodingKey::from_secret(state.jwt_secret.as_bytes()),
-    ).map_err(|e| AppError::Internal(e.to_string()))?;
-
-    tracing::info!("🎫 Token issued for: {} ({})", row.name, row.client_id);
-
-    Ok(Json(json!({
-        "access_token": token,
-        "token_type":   "Bearer",
-        "expires_in":   TOKEN_EXPIRY_SECS,
-        "client_id":    row.client_id,
-    })))
-}
-
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Connector Instances — Dynamic registration with encrypted credentials
-// ─────────────────────────────────────────────────────────────────────────────
-
-#[derive(serde::Deserialize)]
-struct CreateConnectorInstanceBody {
-    id:               Option<String>,
-    name:             String,
-    connector_type:   String,
-    host:             Option<String>,
-    port:             Option<u16>,
-    database_name:    Option<String>,
-    username:         Option<String>,
-    password:         Option<String>,  // plain — will be encrypted
-    extra_attributes: Option<serde_json::Value>,
-}
-
-/// POST /connector-instances — register a new connector instance
-async fn create_connector_instance(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<CreateConnectorInstanceBody>,
-) -> Result<Json<Value>, AppError> {
-    let id = body.id.unwrap_or_else(|| format!("conn_{}", uuid::Uuid::new_v4().simple()));
-    
-  
-    // Reject URL-shaped hosts for database connectors
-    let is_db = matches!(body.connector_type.as_str(), "postgres" | "mysql");
-    if is_db {
-        if let Some(host) = &body.host {
-            if host.starts_with("http://") || host.starts_with("https://") {
-                return Err(AppError::BadRequest(
-                    "Host must be a hostname or IP address, not a URL".into()
-                ));
-            }
-        }
-    }
-
-    let password_encrypted: Option<String> = match body.password.as_deref() {
-        Some(pwd) => Some(state.crypto.encrypt(pwd)
-            .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?),
-        None => None,
-    };
-
-    let extra = body.extra_attributes.unwrap_or(json!({}));
-
-    sqlx::query!(
-        "INSERT INTO connector_instances
-         (id, name, connector_type, host, port, database_name, username, password_encrypted, extra_attributes, active)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, TRUE)",
-        id, body.name, body.connector_type, body.host, body.port.map(|p| p as i32),
-        body.database_name, body.username, password_encrypted, extra
-    )
-    .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-    let instance = common::ConnectorInstance {
-        id:                  id.clone(),
-        name:                body.name.clone(),
-        connector_type:      body.connector_type.clone(),
-        host:                body.host.clone(),
-        port:                body.port,
-        database:            body.database_name.clone(),
-        username:            body.username.clone(),
-        password_encrypted:  password_encrypted.clone(),
-        extra_attributes:    extra.clone(),
-        active:              true,
-        created_at:          chrono::Utc::now(),
-    };
-
-    state.connector_instances.write().await.push(instance.clone());
-
-    let event = common::ConnectorInstanceEvent::Created { instance: instance.clone() };
-    publish_connector_instance_event(&state.nats, &event).await?;
-
-    tracing::info!("✅ Connector instance created: {} ({})", body.name, id);
-
-    Ok(Json(json!({
-        "id":             id,
-        "name":           body.name,
-        "connector_type": body.connector_type,
-        "host":           body.host,
-        "port":           body.port,
-        "status":         "created"
-    })))
-}
-
-/// GET /connector-instances
-async fn list_connector_instances(
-    State(state): State<Arc<AppState>>,
-) -> Json<Value> {
-    let instances = state.connector_instances.read().await;
-    let sanitized: Vec<Value> = instances.iter().map(|c| json!({
-        "id":             c.id,
-        "name":           c.name,
-        "connector_type": c.connector_type,
-        "host":           c.host,
-        "port":           c.port,
-        "database_name":  c.database,
-        "username":       c.username,
-        "active":         c.active,
-        "extra_attributes": c.extra_attributes,
-        "created_at":     c.created_at,
-        // password_encrypted intentionally omitted
-    })).collect();
-
-    Json(json!({ "connectors": sanitized, "count": sanitized.len() }))
-}
-
-
-/// GET /connector-instances/:id
-async fn get_connector_instance(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    let instances = state.connector_instances.read().await;
-    let instance = instances.iter().find(|c| c.id == id)
-        .ok_or_else(|| AppError::NotFound(format!("Connector not found: {}", id)))?;
-
-    Ok(Json(json!({
-        "id":             instance.id,
-        "name":           instance.name,
-        "connector_type": instance.connector_type,
-        "host":           instance.host,
-        "port":           instance.port,
-        "database_name":  instance.database,
-        "username":       instance.username,
-        "active":         instance.active,
-        "extra_attributes": instance.extra_attributes,
-        "created_at":     instance.created_at,
-    })))
-    
-}
-
-// Add handler after list_connector_instances
-async fn list_connector_instances_by_type(
-    State(state): State<Arc<AppState>>,
-    Path(connector_type): Path<String>,
-) -> Json<Value> {
-    let instances = state.connector_instances.read().await;
-    let filtered: Vec<Value> = instances
-        .iter()
-        .filter(|c| c.connector_type == connector_type)
-        .map(|c| json!({
-            "id": c.id,
-            "name": c.name,
-            "connector_type": c.connector_type,
-            "host": c.host,
-            "active": c.active,
-        }))
-        .collect();
-    Json(json!({ "instances": filtered }))
-}
-
-#[derive(serde::Deserialize)]
-struct TestConnectorBody {
-    connector_type: String,
-    host:           Option<String>,
-    port:           Option<u16>,
-    database_name:  Option<String>,
-    username:       Option<String>,
-    password:       Option<String>,
-}
-
-/// POST /connector-instances/test — validate connectivity without persisting
-async fn test_connector_instance(
-    Json(body): Json<TestConnectorBody>,
-) -> Json<Value> {
-    let result = match body.connector_type.as_str() {
-        "postgres" => {
-            test_postgres_connection(
-                body.host.as_deref().unwrap_or("localhost"),
-                body.port.unwrap_or(5432),
-                body.database_name.as_deref().unwrap_or(""),
-                body.username.as_deref().unwrap_or(""),
-                body.password.as_deref().unwrap_or(""),
-            ).await
-        }
-        "mysql" => {
-            test_tcp_connection(
-                body.host.as_deref().unwrap_or("localhost"),
-                body.port.unwrap_or(3306),
-            ).await
-        }
-        "http" => {
-            test_http_connection(body.host.as_deref().unwrap_or("")).await
-        }
-        other => Err(format!("Unknown connector type: {}", other)),
-    };
-
-    match result {
-        Ok(msg)  => Json(json!({ "success": true,  "message": msg })),
-        Err(msg) => Json(json!({ "success": false, "message": msg })),
-    }
-}
-
-/// Translate `localhost` / `127.0.0.1` to `host.docker.internal` so that
-/// connectors can reach databases running on the host machine from inside Docker.
-fn resolve_host(host: &str) -> &str {
-    match host {
-        "localhost" | "127.0.0.1" => "host.docker.internal",
-        other => other,
-    }
-}
-
-async fn test_postgres_connection(
-    host: &str, port: u16, database: &str, username: &str, password: &str,
-) -> Result<String, String> {
-    use sqlx::Connection;
-    use sqlx::postgres::{PgConnectOptions, PgConnection};
-
-    let opts = PgConnectOptions::new()
-        .host(resolve_host(host))
-        .port(port)
-        .database(database)
-        .username(username)
-        .password(password);
-
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        PgConnection::connect_with(&opts),
-    ).await {
-        Ok(Ok(mut conn)) => { conn.close().await.ok(); Ok("PostgreSQL connection successful".into()) }
-        Ok(Err(e))       => Err(format!("Connection failed: {}", e)),
-        Err(_)           => Err("Connection timed out after 10 seconds".into()),
-    }
-}
-
-async fn test_tcp_connection(host: &str, port: u16) -> Result<String, String> {
-    let addr = format!("{}:{}", resolve_host(host), port);
-    match tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        tokio::net::TcpStream::connect(&addr),
-    ).await {
-        Ok(Ok(_))  => Ok(format!("TCP connection to {} successful", addr)),
-        Ok(Err(e)) => Err(format!("Connection failed: {}", e)),
-        Err(_)     => Err("Connection timed out after 10 seconds".into()),
-    }
-}
-
-async fn test_http_connection(url: &str) -> Result<String, String> {
-    if url.is_empty() {
-        return Err("Base URL is required for HTTP connector".into());
-    }
-    // Rewrite localhost in the URL so HTTP connectors on the host machine are reachable
-    let url = &url
-        .replace("://localhost:", "://host.docker.internal:")
-        .replace("://127.0.0.1:", "://host.docker.internal:");
-    let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(10))
-        .build()
-        .map_err(|e| format!("Client error: {}", e))?;
-
-    match client.head(url).send().await {
-        Ok(resp) => Ok(format!("HTTP connection successful ({})", resp.status())),
-        Err(e)   => Err(format!("HTTP request failed: {}", e)),
-    }
-}
-
-
-/// DELETE /connector-instances/:id
-async fn delete_connector_instance(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    sqlx::query!("DELETE FROM connector_instances WHERE id = $1", id)
-        .execute(&state.db).await.map_err(|e| AppError::Internal(e.to_string()))?;
-
-    state.connector_instances.write().await.retain(|c| c.id != id);
-
-    let event = common::ConnectorInstanceEvent::Deleted { id: id.clone() };
-    publish_connector_instance_event(&state.nats, &event).await?;
-
-    tracing::info!("🗑️  Deleted connector instance: {}", id);
-    Ok(Json(json!({ "deleted": id })))
-}
-
-/// PUT /connector-instances/:id
-async fn update_connector_instance(
-    State(state): State<Arc<AppState>>,
-    Path(id): Path<String>,
-    Json(payload): Json<Value>,
-) -> Result<Json<Value>, AppError> {
-    // Extract fields from payload
-    let name = payload["name"].as_str()
-        .ok_or_else(|| AppError::BadRequest("Missing 'name' field".to_string()))?;
-    let connector_type = payload["connector_type"].as_str()
-        .ok_or_else(|| AppError::BadRequest("Missing 'connector_type' field".to_string()))?;
-    let host = payload["host"].as_str();
-    let port = payload["port"].as_i64().map(|p| p as i32);
-    let database = payload["database_name"].as_str();
-    let username = payload["username"].as_str();
-    let password = payload["password"].as_str();
-    let active = payload["active"].as_bool().unwrap_or(true);
-    
-    // Extract extra_attributes if provided
-    let extra_attributes = payload.get("extra_attributes").cloned();
-    
-    // Update in-memory storage
-    let mut instances = state.connector_instances.write().await;
-    let instance = instances.iter_mut().find(|c| c.id == id)
-        .ok_or_else(|| AppError::NotFound(format!("Connector instance not found: {}", id)))?;
-    
-    // Update fields
-    instance.name = name.to_string();
-    instance.connector_type = connector_type.to_string();
-    instance.host = host.map(|s| s.to_string());
-    instance.port = port.map(|p| p as u16);
-    instance.database = database.map(|s| s.to_string());
-    instance.username = username.map(|s| s.to_string());
-    instance.active = active;
-    
-    // Update extra_attributes if provided
-    if let Some(attrs) = &extra_attributes {
-        instance.extra_attributes = attrs.clone();
-    }
-    
-    // Encrypt password if provided
-    if let Some(pwd) = password {
-        let encrypted = state.crypto.encrypt(pwd)
-            .map_err(|e| AppError::Internal(format!("Encryption failed: {}", e)))?;
-        instance.password_encrypted = Some(encrypted);
-    }
-    
-    let updated = instance.clone();
-    drop(instances);
-    
-    // Convert extra_attributes to sqlx::types::Json for database
-    let extra_attrs_json = extra_attributes.as_ref()
-        .map(|v| sqlx::types::Json(v.clone()));
-    
-    // Update in database
-    sqlx::query!(
-        r#"
-        UPDATE connector_instances
-        SET name = $1, connector_type = $2, host = $3, port = $4,
-            database_name = $5, username = $6, password_encrypted = $7, active = $8,
-            extra_attributes = $9
-        WHERE id = $10
-        "#,
-        updated.name,
-        updated.connector_type,
-        updated.host,
-        updated.port.map(|p| p as i32),
-        updated.database,
-        updated.username,
-        updated.password_encrypted,
-        updated.active,
-        extra_attrs_json as Option<sqlx::types::Json<Value>>,
-        id
-    )
-    .execute(&state.db)
-    .await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-    
-    // Publish update event to NATS
-    let event = common::ConnectorInstanceEvent::Updated { instance: updated.clone() };
-    if let Err(e) = publish_connector_instance_event(&state.nats, &event).await {
-        tracing::warn!("Failed to publish connector update event: {}", e);
-    }
-    
-    tracing::info!("✏️ Updated connector instance: {}", updated.name);
-    
-    Ok(Json(json!({
-        "id": updated.id,
-        "name": updated.name,
-        "connector_type": updated.connector_type,
-        "host": updated.host,
-        "port": updated.port,
-        "database": updated.database,
-        "username": updated.username,
-        "active": updated.active,
-        "extra_attributes": updated.extra_attributes,
-        "created_at": updated.created_at,
-    })))
-}
-
-async fn publish_connector_instance_event(
-    nats: &NatsClient,
-    event: &common::ConnectorInstanceEvent,
-) -> Result<(), AppError> {
-    let payload = serde_json::to_vec(event)
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    nats.publish(event.subject(), payload.into()).await
-        .map_err(|e| AppError::Internal(e.to_string()))?;
-    tracing::debug!("📤 Published {}", event.subject());
-    Ok(())
-}
-
-/// Load connector instances from DB on startup
-async fn load_connector_instances(state: &AppState) -> Result<()> {
-    let rows = sqlx::query!(
-        "SELECT id, name, connector_type, host, port, database_name, username,
-                password_encrypted, extra_attributes, active, created_at
-         FROM connector_instances WHERE active = TRUE"
-    )
-    .fetch_all(&state.db).await?;
-
-    let mut instances = state.connector_instances.write().await;
-    for row in rows {
-        instances.push(common::ConnectorInstance {
-            id:                 row.id,
-            name:               row.name,
-            connector_type:     row.connector_type,
-            host:               row.host,
-            port:               row.port.map(|p| p as u16),
-            database:           row.database_name,
-            username:           row.username,
-            password_encrypted: row.password_encrypted,
-            extra_attributes:   row.extra_attributes,
-            active:             row.active,
-            created_at:         row.created_at,
-        });
-    }
-
-    tracing::info!("✅ Loaded {} connector instances from DB", instances.len());
-    Ok(())
-}
-
-// ─── User Management Endpoints (Admin Only) ──────────────────────────────────
-
-/// POST /users/invite — Invite a new user (admin only)
-async fn invite_user(
-    State(state): State<Arc<AppState>>,
-    current_user: Option<Extension<common::User>>,
-    Json(body): Json<InviteUserBody>,
-) -> Result<Json<Value>, AppError> {
-    // Extract user - if RBAC is disabled, this will be None
-    let current_user = current_user
-        .ok_or_else(|| AppError::Unauthorized("Authentication required (enable RBAC)".into()))?
-        .0;
-    
-    if !current_user.is_admin() {
-        return Err(AppError::Unauthorized("Admin role required".into()));
-    }
-
-    // Validate role
-    let role = common::UserRole::from_str(&body.role)
-        .ok_or_else(|| AppError::Internal(format!("Invalid role: {}", body.role)))?;
-
-    // Invite user via Keycloak
-    let user_id = state.oidc.invite_user(&body.email, &role).await
-        .map_err(|e| AppError::Internal(format!("Keycloak invitation failed: {}", e)))?;
-
-    // Store invitation in database
-    let invitation_id = uuid::Uuid::new_v4().to_string();
-    let invitation_token = uuid::Uuid::new_v4().to_string();
-    let expires_at = chrono::Utc::now() + chrono::Duration::days(7);
-
-    sqlx::query!(
-        "INSERT INTO user_invitations (id, email, role, invited_by, invited_at, expires_at, token, accepted)
-         VALUES ($1, $2, $3, $4, NOW(), $5, $6, FALSE)",
-        invitation_id, body.email, role.as_str(), current_user.id, expires_at, invitation_token
-    )
-    .execute(&state.db).await
-    .map_err(|e| AppError::Internal(e.to_string()))?;
-
-    tracing::info!("✅ User invited: {} as {} by {}", body.email, role.as_str(), current_user.username);
-
-    Ok(Json(json!({
-        "invitation_id": invitation_id,
-        "email": body.email,
-        "role": role.as_str(),
-        "keycloak_user_id": user_id,
-        "expires_at": expires_at,
-        "status": "invitation_sent"
-    })))
-}
-
-#[derive(serde::Deserialize)]
-struct InviteUserBody {
-    email: String,
-    role: String,  // "admin", "developer", or "viewer"
-}
-
-/// GET /users — List all users (admin only)
-async fn list_users(
-    State(state): State<Arc<AppState>>,
-) -> Result<Json<Value>, AppError> {
-    let users = state.oidc.list_users().await
-        .map_err(|e| AppError::Internal(format!("Failed to list users: {}", e)))?;
-
-    Ok(Json(json!({
-        "users": users,
-        "count": users.len()
-    })))
-}
-
-/// DELETE /users/:user_id — Delete user (admin only)
-async fn delete_user(
-    State(state): State<Arc<AppState>>,
-    Path(user_id): Path<String>,
-) -> Result<Json<Value>, AppError> {
-    state.oidc.delete_user(&user_id).await
-        .map_err(|e| AppError::Internal(format!("Failed to delete user: {}", e)))?;
-
-    tracing::info!("🗑️  User deleted: {}", user_id);
-
-    Ok(Json(json!({
-        "deleted": user_id,
-        "status": "success"
-    })))
-}
-
-/// GET /users/me — Get current user info
-async fn get_current_user(
-    request: axum::http::Request<axum::body::Body>,
-) -> Result<Json<Value>, AppError> {
-    tracing::info!("Get current user");
-    let user = request.extensions().get::<common::User>()
-        .ok_or_else(|| AppError::Internal("No user context".into()))?;
-
-    Ok(Json(json!({
-        "id": user.id,
-        "username": user.username,
-        "email": user.email,
-        "name": user.name,
-        "roles": user.roles.iter().map(|r| r.as_str()).collect::<Vec<_>>()
-    })))
 }
