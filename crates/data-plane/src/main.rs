@@ -1342,11 +1342,6 @@ async fn connect_flow_connectors(
     let mut executor = state.executor.write().await;
 
     for connector_id in connector_ids {
-        // Skip 'http' - already registered at startup
-        if connector_id == "http" {
-            continue;
-        }
-
         // Skip if already connected — avoids creating a new pool on every request
         if executor.has_connector(&connector_id) {
             continue;

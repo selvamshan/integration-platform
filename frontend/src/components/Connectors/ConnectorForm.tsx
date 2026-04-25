@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { useForm } from 'react-hook-form'
 import { Connector } from '@/types/connector'
 import { connectorDefinitionService, ConnectorDefinition } from '@/services/connectorDefinitions'
+import { connectorService, TestConnectionResult } from '@/services/connector'
 
 interface ConnectorFormProps {
   onSubmit: (data: Connector) => void
@@ -16,6 +17,8 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
     initialValues?.extra_attributes ? JSON.stringify(initialValues.extra_attributes, null, 2) : ''
   )
   const [extraAttrsError, setExtraAttrsError] = useState('')
+  const [testing, setTesting] = useState(false)
+  const [testResult, setTestResult] = useState<TestConnectionResult | null>(null)
 
   useEffect(() => {
     connectorDefinitionService.list()
@@ -24,7 +27,7 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
       .finally(() => setLoadingDefs(false))
   }, [])
 
-  const { register, handleSubmit, watch, setValue } = useForm<Connector>({
+  const { register, handleSubmit, watch, getValues, setValue } = useForm<Connector>({
     defaultValues: initialValues ?? { connector_type: 'postgres' },
   })
 
@@ -48,6 +51,21 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
       setExtraAttrsError('')
     } catch {
       setExtraAttrsError('Invalid JSON')
+    }
+  }
+
+  async function handleTestConnection() {
+    const data = getValues()
+    setTesting(true)
+    setTestResult(null)
+    try {
+      const result = await connectorService.testConnection(data)
+      setTestResult(result)
+    } catch (err: any) {
+      const msg = err?.response?.data?.message ?? err?.message ?? 'Test failed'
+      setTestResult({ success: false, message: msg })
+    } finally {
+      setTesting(false)
     }
   }
 
@@ -148,9 +166,25 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
         )}
       </div>
 
-      <button type="submit" className="btn btn-primary w-full">
-        {isEdit ? 'Save Changes' : 'Create Connector'}
-      </button>
+      <div className="flex gap-2">
+        <button
+          type="button"
+          onClick={handleTestConnection}
+          disabled={testing}
+          className="btn btn-secondary flex-1"
+        >
+          {testing ? 'Testing…' : 'Test Connection'}
+        </button>
+        <button type="submit" className="btn btn-primary flex-1">
+          {isEdit ? 'Save Changes' : 'Create Connector'}
+        </button>
+      </div>
+
+      {testResult && (
+        <p className={`text-sm font-medium ${testResult.success ? 'text-green-600' : 'text-red-600'}`}>
+          {testResult.success ? '✓' : '✗'} {testResult.message}
+        </p>
+      )}
     </form>
   )
 }

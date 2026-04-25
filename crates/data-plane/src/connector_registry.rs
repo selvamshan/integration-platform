@@ -54,6 +54,13 @@ impl CryptoService {
     }
 }
 
+fn resolve_host(host: &str) -> &str {
+    match host {
+        "localhost" | "127.0.0.1" => "host.docker.internal",
+        other => other,
+    }
+}
+
 impl ConnectorRegistry {
     pub fn new(crypto: Arc<CryptoService>) -> Self {
         Self {
@@ -98,7 +105,8 @@ impl ConnectorRegistry {
 
                 let port = instance.port.unwrap_or(5432);
                 let username = instance.username.as_deref().unwrap_or("platform");
-                let host = instance.host.as_deref().unwrap_or("localhost");
+                let raw_host = instance.host.as_deref().unwrap_or("localhost");
+                let host = resolve_host(raw_host);
                 let url = format!(
                     "postgresql://{}:{}@{}:{}/{}",
                     username, password, host, port, database
@@ -110,7 +118,8 @@ impl ConnectorRegistry {
                 tracing::debug!("✅ Connected postgres: {}", connector_id);
             }
             "http" => {
-                let mut conn = HttpConnector::new();
+                let mut conn = HttpConnector::from_config(&instance.extra_attributes)
+                    .unwrap_or_else(|_| HttpConnector::new());
                 conn.connect().await?;
                 executor.register_connector(connector_id.to_string(), Box::new(conn));
                 tracing::debug!("✅ Connected http: {}", connector_id);

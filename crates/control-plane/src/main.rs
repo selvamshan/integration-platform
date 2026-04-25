@@ -207,8 +207,9 @@ async fn main() -> Result<()> {
         .route("/auth/clients/:client_id",get(get_client).delete(delete_client).patch(toggle_client))
         .route("/auth/token",             post(issue_token))
          // ── Connector Instances ────────────────────────────────────────────
-        .route("/connector-instances",     post(create_connector_instance).get(list_connector_instances))
-        .route("/connector-instances/:id", get(get_connector_instance).put(update_connector_instance).delete(delete_connector_instance))
+        .route("/connector-instances",          post(create_connector_instance).get(list_connector_instances))
+        .route("/connector-instances/test",     post(test_connector_instance))
+        .route("/connector-instances/:id",      get(get_connector_instance).put(update_connector_instance).delete(delete_connector_instance))
         .route("/connector-instances/type/:connector_type", get(list_connector_instances_by_type))
           // ── User Management (RBAC) ─────────────────────────────────────────
         .route("/users/invite",       post(invite_user))
@@ -1125,6 +1126,111 @@ async fn list_connector_instances_by_type(
         }))
         .collect();
     Json(json!({ "instances": filtered }))
+}
+
+#[derive(serde::Deserialize)]
+struct TestConnectorBody {
+    connector_type: String,
+    host:           Option<String>,
+    port:           Option<u16>,
+    database_name:  Option<String>,
+    username:       Option<String>,
+    password:       Option<String>,
+}
+
+/// POST /connector-instances/test — validate connectivity without persisting
+async fn test_connector_instance(
+    Json(body): Json<TestConnectorBody>,
+) -> Json<Value> {
+    let result = match body.connector_type.as_str() {
+        "postgres" => {
+            test_postgres_connection(
+                body.host.as_deref().unwrap_or("localhost"),
+                body.port.unwrap_or(5432),
+                body.database_name.as_deref().unwrap_or(""),
+                body.username.as_deref().unwrap_or(""),
+                body.password.as_deref().unwrap_or(""),
+            ).await
+        }
+        "mysql" => {
+            test_tcp_connection(
+                body.host.as_deref().unwrap_or("localhost"),
+                body.port.unwrap_or(3306),
+            ).await
+        }
+        "http" => {
+            test_http_connection(body.host.as_deref().unwrap_or("")).await
+        }
+        other => Err(format!("Unknown connector type: {}", other)),
+    };
+
+    match result {
+        Ok(msg)  => Json(json!({ "success": true,  "message": msg })),
+        Err(msg) => Json(json!({ "success": false, "message": msg })),
+    }
+}
+
+/// Translate `localhost` / `127.0.0.1` to `host.docker.internal` so that
+/// connectors can reach databases running on the host machine from inside Docker.
+fn resolve_host(host: &str) -> &str {
+    match host {
+        "localhost" | "127.0.0.1" => "host.docker.internal",
+        other => other,
+    }
+}
+
+async fn test_postgres_connection(
+    host: &str, port: u16, database: &str, username: &str, password: &str,
+) -> Result<String, String> {
+    use sqlx::Connection;
+    use sqlx::postgres::{PgConnectOptions, PgConnection};
+
+    let opts = PgConnectOptions::new()
+        .host(resolve_host(host))
+        .port(port)
+        .database(database)
+        .username(username)
+        .password(password);
+
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        PgConnection::connect_with(&opts),
+    ).await {
+        Ok(Ok(mut conn)) => { conn.close().await.ok(); Ok("PostgreSQL connection successful".into()) }
+        Ok(Err(e))       => Err(format!("Connection failed: {}", e)),
+        Err(_)           => Err("Connection timed out after 10 seconds".into()),
+    }
+}
+
+async fn test_tcp_connection(host: &str, port: u16) -> Result<String, String> {
+    let addr = format!("{}:{}", resolve_host(host), port);
+    match tokio::time::timeout(
+        std::time::Duration::from_secs(10),
+        tokio::net::TcpStream::connect(&addr),
+    ).await {
+        Ok(Ok(_))  => Ok(format!("TCP connection to {} successful", addr)),
+        Ok(Err(e)) => Err(format!("Connection failed: {}", e)),
+        Err(_)     => Err("Connection timed out after 10 seconds".into()),
+    }
+}
+
+async fn test_http_connection(url: &str) -> Result<String, String> {
+    if url.is_empty() {
+        return Err("Base URL is required for HTTP connector".into());
+    }
+    // Rewrite localhost in the URL so HTTP connectors on the host machine are reachable
+    let url = &url
+        .replace("://localhost:", "://host.docker.internal:")
+        .replace("://127.0.0.1:", "://host.docker.internal:");
+    let client = reqwest::Client::builder()
+        .timeout(std::time::Duration::from_secs(10))
+        .build()
+        .map_err(|e| format!("Client error: {}", e))?;
+
+    match client.head(url).send().await {
+        Ok(resp) => Ok(format!("HTTP connection successful ({})", resp.status())),
+        Err(e)   => Err(format!("HTTP request failed: {}", e)),
+    }
 }
 
 
