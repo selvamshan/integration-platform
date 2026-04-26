@@ -53,6 +53,28 @@ impl Connector for MySqlConnector {
     }
 }
 
+/// Convert `$1`, `$2`, … positional placeholders (PostgreSQL style) to `?` (MySQL style).
+fn normalize_placeholders(sql: &str) -> String {
+    let mut result = String::with_capacity(sql.len());
+    let mut chars = sql.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '$' {
+            if chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                // consume all following digits
+                while chars.peek().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+                    chars.next();
+                }
+                result.push('?');
+            } else {
+                result.push('$');
+            }
+        } else {
+            result.push(ch);
+        }
+    }
+    result
+}
+
 fn bind_json<'q>(
     query: sqlx::query::Query<'q, sqlx::MySql, sqlx::mysql::MySqlArguments>,
     value: &Value,
@@ -85,10 +107,12 @@ impl MySqlConnector {
         let pool = self.pool.as_ref()
             .ok_or_else(|| Error::Connector("Not connected to MySQL".into()))?;
 
-        let sql = params.payload.get("sql")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Connector("Missing 'sql' parameter".into()))?
-            .to_string();
+        let sql = {
+            let raw = params.payload.get("sql")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Connector("Missing 'sql' parameter".into()))?;
+            normalize_placeholders(raw)
+        };
 
         let sql_params: Vec<Value> = params.payload.get("params")
             .and_then(|v| v.as_array())
@@ -147,10 +171,12 @@ impl MySqlConnector {
         let pool = self.pool.as_ref()
             .ok_or_else(|| Error::Connector("Not connected to MySQL".into()))?;
 
-        let sql = params.payload.get("sql")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| Error::Connector("Missing 'sql' parameter".into()))?
-            .to_string();
+        let sql = {
+            let raw = params.payload.get("sql")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| Error::Connector("Missing 'sql' parameter".into()))?;
+            normalize_placeholders(raw)
+        };
 
         let sql_params: Vec<Value> = params.payload.get("params")
             .and_then(|v| v.as_array())

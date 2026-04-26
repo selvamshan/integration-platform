@@ -1,0 +1,45 @@
+use std::collections::HashMap;
+use std::sync::Arc;
+use tokio::sync::RwLock;
+use async_nats::Client as NatsClient;
+
+use common::{CircuitState, FlowDefinition};
+use integration_runtime::FlowExecutor;
+
+use crate::connector_registry::ConnectorRegistry;
+use crate::scheduler::FlowScheduler;
+
+pub type RedisConnection = redis::aio::ConnectionManager;
+
+#[derive(Debug, Clone)]
+pub struct CircuitBreakerState {
+    pub state: CircuitState,
+    pub failure_count: u32,
+    pub success_count: u32,
+    pub last_failure_time: u64,
+    pub opened_at: u64,
+}
+
+impl CircuitBreakerState {
+    pub fn new() -> Self {
+        Self {
+            state: CircuitState::Closed,
+            failure_count: 0,
+            success_count: 0,
+            last_failure_time: 0,
+            opened_at: 0,
+        }
+    }
+}
+
+pub struct AppState {
+    pub executor:           Arc<RwLock<FlowExecutor>>,
+    pub flows:              Arc<RwLock<HashMap<String, FlowDefinition>>>,
+    pub circuit_breakers:   Arc<RwLock<HashMap<String, CircuitBreakerState>>>,
+    pub connector_registry: Arc<ConnectorRegistry>,
+    pub nats:               NatsClient,
+    pub redis:              RedisConnection,
+    pub node_id:            String,
+    pub jwt_secret:         String,
+    pub scheduler:          Arc<FlowScheduler>,
+}

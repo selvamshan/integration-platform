@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
 use integration_runtime::FlowExecutor;
-use integration_runtime::connectors::{http::HttpConnector, postgres::PostgresConnector};
+use integration_runtime::connectors::{http::HttpConnector, mysql::MySqlConnector, postgres::PostgresConnector};
 use common::{Connector, ConnectorInstance};
 
 pub struct ConnectorRegistry {
@@ -116,6 +116,22 @@ impl ConnectorRegistry {
                 conn.connect().await?;
                 executor.register_connector(connector_id.to_string(), Box::new(conn));
                 tracing::debug!("✅ Connected postgres: {}", connector_id);
+            }
+            "mysql" => {
+                let port = instance.port.unwrap_or(3306);
+                let username = instance.username.as_deref().unwrap_or("root");
+                let raw_host = instance.host.as_deref().unwrap_or("localhost");
+                let host = resolve_host(raw_host);
+                let database = instance.database.as_deref().unwrap_or("");
+                let url = format!(
+                    "mysql://{}:{}@{}:{}/{}",
+                    username, password, host, port, database
+                );
+
+                let mut conn = MySqlConnector::new(url);
+                conn.connect().await?;
+                executor.register_connector(connector_id.to_string(), Box::new(conn));
+                tracing::debug!("✅ Connected mysql: {}", connector_id);
             }
             "http" => {
                 let mut conn = HttpConnector::from_config(&instance.extra_attributes)
