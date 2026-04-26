@@ -29,6 +29,8 @@ export interface FlowEdge {
 export interface Flow {
   id: string
   name: string
+  /** Client that owns this flow */
+  client_id?: string
   trigger: Trigger
   /** Graph execution model (preferred) */
   nodes: FlowNode[]

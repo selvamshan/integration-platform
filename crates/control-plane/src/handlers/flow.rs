@@ -1,16 +1,16 @@
 use std::sync::Arc;
-use axum::{   
-    extract::{State, Path, Json}   
+use axum::{
+    extract::{State, Path, Json, Query}
 };
 use async_nats::Client as NatsClient;
 
 
-use common::{  
-    ApiDefinition, 
-    FlowDefinition, 
-    Endpoint,  
-    ConfigUpdate,   
-    Trigger,  
+use common::{
+    ApiDefinition,
+    FlowDefinition,
+    Endpoint,
+    ConfigUpdate,
+    Trigger,
 };
 
 use serde::{Deserialize, Serialize};
@@ -207,17 +207,31 @@ pub async fn execute_test_step(
 // .route("/flows/test", post(test_flow))
 
 
+/// Optional query parameters for listing flows
+#[derive(Debug, Deserialize)]
+pub struct ListFlowsQuery {
+    pub client_id: Option<String>,
+}
+
 // Flow endpoints
-pub async fn list_flows(State(state): State<Arc<AppState>>) -> Json<Value> {
+pub async fn list_flows(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<ListFlowsQuery>,
+) -> Json<Value> {
     let flows = state.flows.read().await;
-    Json(json!({"flows": *flows, "count": flows.len()}))
+    let filtered: Vec<&FlowDefinition> = match &query.client_id {
+        Some(cid) => flows.iter().filter(|f| f.client_id.as_deref() == Some(cid.as_str())).collect(),
+        None => flows.iter().collect(),
+    };
+    Json(json!({"flows": filtered, "count": filtered.len()}))
 }
 
 pub async fn create_flow(State(state): State<Arc<AppState>>, Json(flow): Json<FlowDefinition>) -> Result<Json<Value>, AppError> {
     tracing::info!("📡 Creating flow: {}", flow.name);
-    
-    sqlx::query("INSERT INTO flow_definitions (name, config) VALUES ($1, $2)")
+
+    sqlx::query("INSERT INTO flow_definitions (name, client_id, config) VALUES ($1, $2, $3)")
         .bind(&flow.name)
+        .bind(&flow.client_id)
         .bind(serde_json::to_value(&flow).unwrap())
         .execute(&state.db)
         .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
@@ -240,13 +254,14 @@ pub async fn create_flow(State(state): State<Arc<AppState>>, Json(flow): Json<Fl
 
 pub async fn update_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(flow): Json<FlowDefinition>) -> Result<Json<Value>, AppError> {
     tracing::info!("🔄 Updating flow: {}", id);
-    
+
     if flow.id != id {
         return Err(AppError::Internal("Flow ID mismatch".to_string()));
     }
-    
-    sqlx::query("UPDATE flow_definitions SET name = $1, config = $2 WHERE config->>'id' = $3")
+
+    sqlx::query("UPDATE flow_definitions SET name = $1, client_id = $2, config = $3 WHERE config->>'id' = $4")
         .bind(&flow.name)
+        .bind(&flow.client_id)
         .bind(serde_json::to_value(&flow).unwrap())
         .bind(&id)
         .execute(&state.db)
@@ -276,10 +291,13 @@ pub async fn get_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>
     Ok(Json(json!(flow)))
 }
 
-pub async fn delete_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Result<Json<Value>, AppError> {
+pub async fn delete_flow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, AppError> {
     tracing::info!("🗑️  Deleting flow: {}", id);
-    
-    // Get flow before deleting to update API
+
+    // Get flow before deleting to update API definition
     let flow = {
         let flows = state.flows.read().await;
         flows.iter().find(|f| f.id == id).cloned()

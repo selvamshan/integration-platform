@@ -3,13 +3,13 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use axum::{
-    extract::{Path, Query, State},
+    extract::{Path, Query, State, Extension},
     http::HeaderMap,
     Json,
 };
 use serde_json::{json, Value};
 
-use common::{FlowDefinition, Message};
+use common::{AuthPrincipal, FlowDefinition, Message};
 
 use crate::circuit_breaker::{update_circuit_breaker_on_failure, update_circuit_breaker_on_success};
 use crate::error::AppError;
@@ -44,9 +44,24 @@ pub async fn list_flows(State(state): State<Arc<AppState>>) -> Json<Value> {
 
 pub async fn execute_flow(
     State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<AuthPrincipal>,
     Path(flow_id): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
+    // Enforce client ownership: if the flow has a client_id it must match the caller.
+    {
+        let flows = state.flows.read().await;
+        if let Some(flow) = flows.get(&flow_id) {
+            if let Some(owner) = &flow.client_id {
+                if *owner != principal.client_id {
+                    return Err(AppError::Forbidden(
+                        "This flow does not belong to your client".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
     execute_flow_inner(&state, &flow_id, payload)
         .await
         .map(Json)
@@ -75,6 +90,7 @@ fn match_path_pattern(pattern: &str, actual: &str) -> Option<HashMap<String, Str
 
 pub async fn trigger_flow(
     State(state): State<Arc<AppState>>,
+    Extension(principal): Extension<AuthPrincipal>,
     method: axum::http::Method,
     Path(path): Path<String>,
     Query(query_params): Query<HashMap<String, String>>,
@@ -105,6 +121,15 @@ pub async fn trigger_flow(
             ))),
         }
     };
+
+    // Enforce client ownership for HTTP-triggered flows.
+    if let Some(owner) = &flow.client_id {
+        if *owner != principal.client_id {
+            return Err(AppError::Forbidden(
+                "This flow does not belong to your client".to_string(),
+            ));
+        }
+    }
 
     let flow_id = flow.id.clone();
 

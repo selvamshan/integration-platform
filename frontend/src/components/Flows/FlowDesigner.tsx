@@ -106,6 +106,8 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
   const [copied, setCopied] = useState(false)
   const [flowName, setFlowName] = useState('My Flow')
   const [customFlowId, setCustomFlowId] = useState('')
+  const [clientId, setClientId] = useState<string>('')
+  const [clients, setClients] = useState<{ client_id: string; name: string; active: boolean }[]>([])
   const [saving, setSaving] = useState(false)
   const [saveError, setSaveError] = useState<string | null>(null)
   const [saveSuccess, setSaveSuccess] = useState<string | null>(null)
@@ -245,6 +247,13 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
 
   const handleCloseEdgePanel = useCallback(() => setSelectedEdge(null), [])
 
+  // ── Load clients for the client selector ─────────────────────────────────
+  useEffect(() => {
+    api.get('/auth/clients')
+      .then((res) => setClients(res.data.clients ?? []))
+      .catch(() => {})
+  }, [])
+
   // ── Load initial flow (edit mode) ─────────────────────────────────────────
   useEffect(() => {
     if (!initialFlow) return
@@ -259,6 +268,7 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
 
     const doLoad = async () => {
       setFlowName(initialFlow.name)
+      setClientId(initialFlow.client_id ?? '')
 
       // Build lookup maps: connector_type → definition, instance_id → connector_type
       const connectorDefsMap = new Map<string, any>()
@@ -527,12 +537,13 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
     return {
       id: flowId || customFlowId.trim() || generatedId.current,
       name: flowName,
+      ...(clientId ? { client_id: clientId } : {}),
       trigger,
       nodes: flowNodes,
       edges: flowEdges,
       ...(rateLimit ? { rate_limit: rateLimit } : {}),
     }
-  }, [nodes, edges, flowId, flowName, customFlowId])
+  }, [nodes, edges, flowId, flowName, customFlowId, clientId])
 
   // ── Save ──────────────────────────────────────────────────────────────────
   const handleSave = async () => {
@@ -740,6 +751,21 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
                 placeholder="My Flow"
                 className="input text-sm h-8 flex-1 max-w-xs"
               />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <label className="text-xs font-medium text-gray-600 whitespace-nowrap">Client</label>
+              <select
+                value={clientId}
+                onChange={(e) => setClientId(e.target.value)}
+                className="input text-sm h-8 w-48"
+              >
+                <option value="">— unassigned —</option>
+                {clients.map((c) => (
+                  <option key={c.client_id} value={c.client_id} disabled={!c.active}>
+                    {c.name}{!c.active ? ' (inactive)' : ''}
+                  </option>
+                ))}
+              </select>
             </div>
             <div className="text-xs text-gray-500 ml-auto">
               {nodes.length} nodes · {edges.length} connections

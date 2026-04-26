@@ -209,6 +209,9 @@ pub enum EdgeCondition {
 pub struct FlowDefinition {
     pub id: String,
     pub name: String,
+    /// Client that owns this flow — only this client may execute or manage it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
     pub trigger: Trigger,
     /// Graph-based execution model (preferred)
     #[serde(default)]
