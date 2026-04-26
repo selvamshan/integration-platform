@@ -317,7 +317,7 @@ impl AuditLogger {
                 parameters: r.parameters,
                 error_message: r.error_message,
                 duration_ms: r.duration_ms,
-                created_at: r.created_at.unwrap_or_else(Utc::now),
+                created_at: r.created_at,
             })
         }).collect()
     }
@@ -374,7 +374,7 @@ impl AuditLogger {
                 parameters: r.parameters,
                 error_message: r.error_message,
                 duration_ms: r.duration_ms,
-                created_at: r.created_at.unwrap_or_else(Utc::now),
+                created_at: r.created_at,
             })
         }).collect()
     }
@@ -428,7 +428,7 @@ impl AuditLogger {
                 parameters: r.parameters,
                 error_message: r.error_message,
                 duration_ms: r.duration_ms,
-                created_at: r.created_at.unwrap_or_else(Utc::now),
+                created_at: r.created_at,
             })
         }).collect()
     }
