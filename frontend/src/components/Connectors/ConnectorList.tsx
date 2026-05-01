@@ -4,7 +4,9 @@ import { ConnectorInstance } from '@/types/connector'
 const TYPE_LABEL: Record<string, string> = {
   postgres: 'PostgreSQL',
   mysql: 'MySQL',
-  http: 'HTTP',
+  mssql:  'MS SQL Server',
+  oracle: 'Oracle',
+  http:   'HTTP',
 }
 
 export function ConnectorList({ connectors, onEdit, onDelete }: {

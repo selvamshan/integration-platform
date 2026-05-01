@@ -1,7 +1,7 @@
 export interface ConnectorInstance {
   id: string
   name: string
-  connector_type: 'postgres' | 'mysql' | 'http'
+  connector_type: 'postgres' | 'mysql' | 'mssql' | 'oracle' | 'http'
   host?: string
   port?: number
   database_name?: string

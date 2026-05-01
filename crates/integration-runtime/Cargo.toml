@@ -16,3 +16,7 @@ reqwest = { workspace = true }
 async-trait = { workspace = true }
 base64 = "0.21"
 regex = "1.10"
+oracle = "0.5"
+futures = { workspace = true }
+tiberius = { version = "0.12", default-features = false, features = ["tokio", "native-tls"] }
+tokio-util = { version = "0.7", features = ["compat"] }

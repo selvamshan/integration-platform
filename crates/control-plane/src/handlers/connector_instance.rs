@@ -36,7 +36,7 @@ pub async fn create_connector_instance(
 ) -> Result<Json<Value>, AppError> {
     let id = body.id.unwrap_or_else(|| format!("conn_{}", uuid::Uuid::new_v4().simple()));
 
-    let is_db = matches!(body.connector_type.as_str(), "postgres" | "mysql");
+    let is_db = matches!(body.connector_type.as_str(), "postgres" | "mysql" | "mssql" | "oracle");
     if is_db {
         if let Some(host) = &body.host {
             if host.starts_with("http://") || host.starts_with("https://") {
@@ -169,6 +169,18 @@ pub async fn test_connector_instance(Json(body): Json<TestConnectorBody>) -> Jso
             test_tcp_connection(
                 body.host.as_deref().unwrap_or("localhost"),
                 body.port.unwrap_or(3306),
+            ).await
+        }
+        "mssql" => {
+            test_tcp_connection(
+                body.host.as_deref().unwrap_or("localhost"),
+                body.port.unwrap_or(1433),
+            ).await
+        }
+        "oracle" => {
+            test_tcp_connection(
+                body.host.as_deref().unwrap_or("localhost"),
+                body.port.unwrap_or(1521),
             ).await
         }
         "http" => test_http_connection(body.host.as_deref().unwrap_or("")).await,

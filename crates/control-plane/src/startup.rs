@@ -206,6 +206,110 @@ pub async fn initialize_builtin_registry(state: Arc<AppState>) -> Result<()> {
         enabled:       true,
     }).await?;
 
+    save_connector(&state, ConnectorDefinition {
+        id:             "mssql-connector".to_string(),
+        name:           "MS SQL Server".to_string(),
+        connector_type: "mssql".to_string(),
+        description:    "Execute SQL queries on Microsoft SQL Server".to_string(),
+        icon:           Some("🗄️".to_string()),
+        operations: vec![
+            common::ConnectorOperation {
+                name:        "query".to_string(),
+                description: "Execute SELECT query".to_string(),
+                parameters:  vec![
+                    common::OperationParameter {
+                        name:          "sql".to_string(),
+                        param_type:    "string".to_string(),
+                        required:      true,
+                        description:   "SQL SELECT statement".to_string(),
+                        default_value: None,
+                    },
+                    common::OperationParameter {
+                        name:          "params".to_string(),
+                        param_type:    "array".to_string(),
+                        required:      false,
+                        description:   "Positional query parameters".to_string(),
+                        default_value: Some(json!([])),
+                    },
+                ],
+            },
+            common::ConnectorOperation {
+                name:        "execute".to_string(),
+                description: "Execute INSERT/UPDATE/DELETE".to_string(),
+                parameters:  vec![
+                    common::OperationParameter {
+                        name:          "sql".to_string(),
+                        param_type:    "string".to_string(),
+                        required:      true,
+                        description:   "SQL statement".to_string(),
+                        default_value: None,
+                    },
+                    common::OperationParameter {
+                        name:          "params".to_string(),
+                        param_type:    "array".to_string(),
+                        required:      false,
+                        description:   "Positional query parameters".to_string(),
+                        default_value: Some(json!([])),
+                    },
+                ],
+            },
+        ],
+        config_schema: json!({"type": "object", "properties": {"connection_string": {"type": "string"}}}),
+        enabled:       true,
+    }).await?;
+
+    save_connector(&state, ConnectorDefinition {
+        id:             "oracle-connector".to_string(),
+        name:           "Oracle".to_string(),
+        connector_type: "oracle".to_string(),
+        description:    "Execute SQL queries on Oracle Database".to_string(),
+        icon:           Some("🔶".to_string()),
+        operations: vec![
+            common::ConnectorOperation {
+                name:        "query".to_string(),
+                description: "Execute SELECT query".to_string(),
+                parameters:  vec![
+                    common::OperationParameter {
+                        name:          "sql".to_string(),
+                        param_type:    "string".to_string(),
+                        required:      true,
+                        description:   "SQL SELECT statement".to_string(),
+                        default_value: None,
+                    },
+                    common::OperationParameter {
+                        name:          "params".to_string(),
+                        param_type:    "array".to_string(),
+                        required:      false,
+                        description:   "Positional query parameters".to_string(),
+                        default_value: Some(json!([])),
+                    },
+                ],
+            },
+            common::ConnectorOperation {
+                name:        "execute".to_string(),
+                description: "Execute INSERT/UPDATE/DELETE".to_string(),
+                parameters:  vec![
+                    common::OperationParameter {
+                        name:          "sql".to_string(),
+                        param_type:    "string".to_string(),
+                        required:      true,
+                        description:   "SQL statement".to_string(),
+                        default_value: None,
+                    },
+                    common::OperationParameter {
+                        name:          "params".to_string(),
+                        param_type:    "array".to_string(),
+                        required:      false,
+                        description:   "Positional query parameters".to_string(),
+                        default_value: Some(json!([])),
+                    },
+                ],
+            },
+        ],
+        config_schema: json!({"type": "object", "properties": {"connection_string": {"type": "string"}}}),
+        enabled:       true,
+    }).await?;
+
     save_trigger(&state, TriggerDefinition {
         id:           "http-trigger".to_string(),
         name:         "HTTP Request".to_string(),

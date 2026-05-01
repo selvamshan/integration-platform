@@ -38,7 +38,7 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
   }, [loadingDefs, isEdit, initialValues, setValue])
 
   const connectorType = watch('connector_type')
-  const isDb = connectorType === 'postgres' || connectorType === 'mysql'
+  const isDb = connectorType === 'postgres' || connectorType === 'mysql' || connectorType === 'mssql' || connectorType === 'oracle'
 
   function handleExtraAttrsChange(value: string) {
     setExtraAttrsText(value)
@@ -78,8 +78,8 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
         return
       }
     }
-    // Postgres/MySQL host must be a plain hostname or IP, not a URL
-    const isDbConnector = data.connector_type === 'postgres' || data.connector_type === 'mysql'
+    // DB host must be a plain hostname or IP, not a URL
+    const isDbConnector = data.connector_type === 'postgres' || data.connector_type === 'mysql' || data.connector_type === 'mssql' || data.connector_type === 'oracle'
     if (isDbConnector && data.host && /^https?:\/\//i.test(data.host)) {
       alert('Host must be a hostname or IP address (e.g. localhost), not a URL')
       return
@@ -129,7 +129,7 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
               placeholder="Port"
               type="number"
               className="input"
-              defaultValue={connectorType === 'mysql' ? 3306 : 5432}
+              defaultValue={connectorType === 'mysql' ? 3306 : connectorType === 'mssql' ? 1433 : connectorType === 'oracle' ? 1521 : 5432}
               required
             />
           </div>

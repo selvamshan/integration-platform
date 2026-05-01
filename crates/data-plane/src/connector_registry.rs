@@ -6,7 +6,7 @@ use std::sync::Arc;
 use tokio::sync::RwLock;
 use anyhow::Result;
 use integration_runtime::FlowExecutor;
-use integration_runtime::connectors::{http::HttpConnector, mysql::MySqlConnector, postgres::PostgresConnector};
+use integration_runtime::connectors::{http::HttpConnector, mssql::MssqlConnector, mysql::MySqlConnector, oracle::OracleConnector, postgres::PostgresConnector};
 use common::{Connector, ConnectorInstance};
 
 pub struct ConnectorRegistry {
@@ -132,6 +132,35 @@ impl ConnectorRegistry {
                 conn.connect().await?;
                 executor.register_connector(connector_id.to_string(), Box::new(conn));
                 tracing::debug!("✅ Connected mysql: {}", connector_id);
+            }
+            "mssql" => {
+                let port = instance.port.unwrap_or(1433);
+                let username = instance.username.as_deref().unwrap_or("sa");
+                let raw_host = instance.host.as_deref().unwrap_or("localhost");
+                let host = resolve_host(raw_host);
+                let database = instance.database.as_deref().unwrap_or("");
+                let url = format!(
+                    "mssql://{}:{}@{}:{}/{}",
+                    username, password, host, port, database
+                );
+
+                let mut conn = MssqlConnector::new(url);
+                conn.connect().await?;
+                executor.register_connector(connector_id.to_string(), Box::new(conn));
+                tracing::debug!("✅ Connected mssql: {}", connector_id);
+            }
+            "oracle" => {
+                let port         = instance.port.unwrap_or(1521);
+                let raw_host     = instance.host.as_deref().unwrap_or("localhost");
+                let host         = resolve_host(raw_host);
+                let service_name = instance.database.as_deref().unwrap_or("ORCL");
+                let username     = instance.username.as_deref().unwrap_or("system").to_string();
+                let connect_str  = format!("//{}:{}/{}", host, port, service_name);
+
+                let mut conn = OracleConnector::new(username, password, connect_str);
+                conn.connect().await?;
+                executor.register_connector(connector_id.to_string(), Box::new(conn));
+                tracing::debug!("✅ Connected oracle: {}", connector_id);
             }
             "http" => {
                 let mut conn = HttpConnector::from_config(&instance.extra_attributes)

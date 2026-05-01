@@ -1,6 +1,29 @@
 FROM rust:1.90 AS builder
 
+# Oracle Instant Client version — update ARGs together when upgrading
+ARG OIC_VERSION=21.9.0.0.0
+ARG OIC_BUILD=219000
+ARG OIC_DIR=instantclient_21_9
+
 WORKDIR /app
+
+RUN apt-get update && apt-get install -y \
+    wget unzip pkg-config libssl-dev \
+    && { apt-get install -y libaio1t64 || apt-get install -y libaio1; } \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Oracle Instant Client so the oracle crate can link against libclntsh.so
+RUN wget -q \
+    "https://download.oracle.com/otn_software/linux/instantclient/${OIC_BUILD}/instantclient-basiclite-linux.x64-${OIC_VERSION}dbru.zip" \
+    -O /tmp/instantclient.zip \
+    && unzip /tmp/instantclient.zip -d /opt/oracle \
+    && rm /tmp/instantclient.zip
+
+# Tell oracle crate's build.rs where libclntsh.so lives, and embed the rpath
+# so the runtime binary resolves the library without needing LD_LIBRARY_PATH.
+ENV OCI_LIB_DIR=/opt/oracle/${OIC_DIR}
+ENV LD_LIBRARY_PATH=/opt/oracle/${OIC_DIR}
+ENV RUSTFLAGS="-C link-arg=-Wl,-rpath,/opt/oracle/${OIC_DIR}"
 
 # Copy entire workspace
 COPY Cargo.toml ./
@@ -9,13 +32,22 @@ COPY crates ./crates
 # Build the data-plane binary
 RUN cargo build --release -p data-plane
 
-# Runtime stage
+# ─── Runtime ────────────────────────────────────────────────────────────────
 FROM debian:bookworm-slim
 
-RUN apt-get update && apt-get install -y \
-    ca-certificates \
-    libssl3 \
-    && rm -rf /var/lib/apt/lists/*
+ARG OIC_DIR=instantclient_21_9
+
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends ca-certificates libssl3 \
+ && { apt-get install -y --no-install-recommends libaio1t64 \
+      || apt-get install -y --no-install-recommends libaio1; } \
+ && rm -rf /var/lib/apt/lists/*
+
+# Reuse the Instant Client downloaded in the builder — no second download needed
+COPY --from=builder /opt/oracle/${OIC_DIR} /opt/oracle/${OIC_DIR}
+
+# Register library path so ldconfig picks it up alongside the embedded rpath
+RUN echo "/opt/oracle/${OIC_DIR}" > /etc/ld.so.conf.d/oracle-instantclient.conf && ldconfig
 
 COPY --from=builder /app/target/release/data-plane /usr/local/bin/data-plane
 
