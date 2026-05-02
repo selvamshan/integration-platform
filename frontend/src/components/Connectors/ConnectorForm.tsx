@@ -40,6 +40,14 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
   const connectorType = watch('connector_type')
   const isDb = connectorType === 'postgres' || connectorType === 'mysql' || connectorType === 'mssql' || connectorType === 'oracle'
 
+  const DEFAULT_PORTS: Record<string, number> = { postgres: 5432, mysql: 3306, mssql: 1433, oracle: 1521 }
+
+  useEffect(() => {
+    if (!isEdit && connectorType in DEFAULT_PORTS) {
+      setValue('port', DEFAULT_PORTS[connectorType])
+    }
+  }, [connectorType])
+
   function handleExtraAttrsChange(value: string) {
     setExtraAttrsText(value)
     if (value.trim() === '') {
@@ -129,7 +137,6 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
               placeholder="Port"
               type="number"
               className="input"
-              defaultValue={connectorType === 'mysql' ? 3306 : connectorType === 'mssql' ? 1433 : connectorType === 'oracle' ? 1521 : 5432}
               required
             />
           </div>

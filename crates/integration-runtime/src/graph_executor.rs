@@ -82,6 +82,9 @@ where
     let mut outputs: HashMap<&str, Message> = HashMap::new();
     // Outcomes for edge-condition evaluation
     let mut outcomes: HashMap<&str, StepOutcome> = HashMap::new();
+    // Track the last node error; never cleared by a subsequent node's success.
+    // A node failure always propagates unless the flow has no more nodes to run.
+    let mut last_error: Option<Error> = None;
 
     // Seed queue with root nodes (in-degree 0)
     let mut queue: VecDeque<&str> = nodes
@@ -116,9 +119,7 @@ where
             }
             Err(e) => {
                 warn!("graph_executor: node '{}' failed: {}", node_id, e);
-                // On failure we keep propagating last output so error-path nodes
-                // receive context; the error itself is swallowed here so that
-                // on_error edges can handle it.
+                last_error = Some(e);
                 (last_output.clone(), StepOutcome::Failure)
             }
         };
@@ -157,6 +158,9 @@ where
         }
     }
 
+    if let Some(e) = last_error {
+        return Err(e);
+    }
     Ok(last_output)
 }
 

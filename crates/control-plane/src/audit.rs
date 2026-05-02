@@ -31,7 +31,6 @@ pub struct AuditLog {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "UPPERCASE")]
 pub enum AuditAction {
     Create,
     Update,
@@ -80,7 +79,6 @@ impl std::str::FromStr for AuditAction {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-#[serde(rename_all = "UPPERCASE")]
 pub enum AuditStatus {
     Success,
     Failure,

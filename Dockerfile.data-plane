@@ -33,7 +33,7 @@ COPY crates ./crates
 RUN cargo build --release -p data-plane
 
 # ─── Runtime ────────────────────────────────────────────────────────────────
-FROM debian:bookworm-slim
+FROM debian:trixie-slim
 
 ARG OIC_DIR=instantclient_21_9
 

@@ -1,6 +1,6 @@
 use std::sync::Arc;
 use axum::{
-    extract::{State, Path, Json, Query}
+    extract::{State, Path, Json, Query, Extension},
 };
 use async_nats::Client as NatsClient;
 
@@ -12,6 +12,7 @@ use common::{
     ConfigUpdate,
     Trigger,
 };
+use crate::audit::AuditAction;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -226,7 +227,11 @@ pub async fn list_flows(
     Json(json!({"flows": filtered, "count": filtered.len()}))
 }
 
-pub async fn create_flow(State(state): State<Arc<AppState>>, Json(flow): Json<FlowDefinition>) -> Result<Json<Value>, AppError> {
+pub async fn create_flow(
+    State(state): State<Arc<AppState>>,
+    user: Option<Extension<common::User>>,
+    Json(flow): Json<FlowDefinition>,
+) -> Result<Json<Value>, AppError> {
     tracing::info!("📡 Creating flow: {}", flow.name);
 
     sqlx::query("INSERT INTO flow_definitions (name, client_id, config) VALUES ($1, $2, $3)")
@@ -235,24 +240,35 @@ pub async fn create_flow(State(state): State<Arc<AppState>>, Json(flow): Json<Fl
         .bind(serde_json::to_value(&flow).unwrap())
         .execute(&state.db)
         .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
+
     let mut flows = state.flows.write().await;
     flows.push(flow.clone());
     drop(flows);
-    
+
     // Auto-create or update API definition for HTTP triggers
     if let Trigger::Http { path, method } = &flow.trigger {
         auto_update_api_definition(&state, &flow, path, method).await?;
     }
-    
+
     let event = ConfigUpdate::FlowCreated { flow: flow.clone() };
     publish_event(&state.nats, &event).await?;
-    
+
+    let (uid, uemail) = user_info(&user);
+    let _ = state.audit_logger.log_success(
+        "flow", &flow.id, Some(&flow.name), AuditAction::Create,
+        uid, uemail, Some(serde_json::to_value(&flow).unwrap()), None,
+    ).await;
+
     tracing::info!("✅ Flow created and API auto-updated: {}", flow.id);
     Ok(Json(json!(flow)))
 }
 
-pub async fn update_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>, Json(flow): Json<FlowDefinition>) -> Result<Json<Value>, AppError> {
+pub async fn update_flow(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    user: Option<Extension<common::User>>,
+    Json(flow): Json<FlowDefinition>,
+) -> Result<Json<Value>, AppError> {
     tracing::info!("🔄 Updating flow: {}", id);
 
     if flow.id != id {
@@ -266,21 +282,27 @@ pub async fn update_flow(State(state): State<Arc<AppState>>, Path(id): Path<Stri
         .bind(&id)
         .execute(&state.db)
         .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
+
     let mut flows = state.flows.write().await;
     if let Some(existing) = flows.iter_mut().find(|f| f.id == id) {
         *existing = flow.clone();
     }
     drop(flows);
-    
+
     // Auto-update API definition
     if let Trigger::Http { path, method } = &flow.trigger {
         auto_update_api_definition(&state, &flow, path, method).await?;
     }
-    
+
     let event = ConfigUpdate::FlowUpdated { flow: flow.clone() };
     publish_event(&state.nats, &event).await?;
-    
+
+    let (uid, uemail) = user_info(&user);
+    let _ = state.audit_logger.log_success(
+        "flow", &id, Some(&flow.name), AuditAction::Update,
+        uid, uemail, Some(serde_json::to_value(&flow).unwrap()), None,
+    ).await;
+
     tracing::info!("✅ Flow updated and API auto-updated: {}", id);
     Ok(Json(json!(flow)))
 }
@@ -294,6 +316,7 @@ pub async fn get_flow(State(state): State<Arc<AppState>>, Path(id): Path<String>
 pub async fn delete_flow(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    user: Option<Extension<common::User>>,
 ) -> Result<Json<Value>, AppError> {
     tracing::info!("🗑️  Deleting flow: {}", id);
 
@@ -302,26 +325,33 @@ pub async fn delete_flow(
         let flows = state.flows.read().await;
         flows.iter().find(|f| f.id == id).cloned()
     };
-    
+    let flow_name = flow.as_ref().map(|f| f.name.clone());
+
     sqlx::query("DELETE FROM flow_definitions WHERE config->>'id' = $1")
         .bind(&id)
         .execute(&state.db)
         .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
-    
+
     let mut flows = state.flows.write().await;
     flows.retain(|f| f.id != id);
     drop(flows);
-    
+
     // Remove from API definition
     if let Some(flow) = flow {
         if let Trigger::Http { path, .. } = &flow.trigger {
             remove_from_api_definition(&state, &id, path).await?;
         }
     }
-    
+
     let event = ConfigUpdate::FlowDeleted { flow_id: id.clone() };
     publish_event(&state.nats, &event).await?;
-    
+
+    let (uid, uemail) = user_info(&user);
+    let _ = state.audit_logger.log_success(
+        "flow", &id, flow_name.as_deref(), AuditAction::Delete,
+        uid, uemail, None, None,
+    ).await;
+
     tracing::info!("✅ Flow deleted and API updated: {}", id);
     Ok(Json(json!({"deleted": true, "flow_id": id})))
 }
@@ -425,6 +455,13 @@ async fn remove_from_api_definition(state: &AppState, flow_id: &str, _path: &str
     }
     
     Ok(())
+}
+
+fn user_info<'a>(user: &'a Option<Extension<common::User>>) -> (&'a str, Option<&'a str>) {
+    match user {
+        Some(Extension(u)) => (u.id.as_str(), Some(u.email.as_str())),
+        None => ("system", None),
+    }
 }
 
 pub async fn publish_event(nats: &NatsClient, event: &ConfigUpdate) -> Result<(), AppError> {

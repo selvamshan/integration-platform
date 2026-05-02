@@ -1,11 +1,19 @@
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::Json;
 use async_nats::Client as NatsClient;
 use serde_json::{json, Value};
 use std::sync::Arc;
 
+use crate::audit::AuditAction;
 use crate::error::AppError;
 use crate::state::AppState;
+
+fn user_info<'a>(user: &'a Option<Extension<common::User>>) -> (&'a str, Option<&'a str>) {
+    match user {
+        Some(Extension(u)) => (u.id.as_str(), Some(u.email.as_str())),
+        None => ("system", None),
+    }
+}
 
 #[derive(serde::Deserialize)]
 pub struct CreateConnectorInstanceBody {
@@ -32,6 +40,7 @@ pub struct TestConnectorBody {
 
 pub async fn create_connector_instance(
     State(state): State<Arc<AppState>>,
+    user: Option<Extension<common::User>>,
     Json(body): Json<CreateConnectorInstanceBody>,
 ) -> Result<Json<Value>, AppError> {
     let id = body.id.unwrap_or_else(|| format!("conn_{}", uuid::Uuid::new_v4().simple()));
@@ -84,6 +93,12 @@ pub async fn create_connector_instance(
 
     let event = common::ConnectorInstanceEvent::Created { instance: instance.clone() };
     publish_connector_instance_event(&state.nats, &event).await?;
+
+    let (uid, uemail) = user_info(&user);
+    let _ = state.audit_logger.log_success(
+        "connector_instance", &id, Some(&body.name), AuditAction::Create,
+        uid, uemail, None, None,
+    ).await;
 
     tracing::info!("✅ Connector instance created: {} ({})", body.name, id);
 
@@ -196,7 +211,13 @@ pub async fn test_connector_instance(Json(body): Json<TestConnectorBody>) -> Jso
 pub async fn delete_connector_instance(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    user: Option<Extension<common::User>>,
 ) -> Result<Json<Value>, AppError> {
+    let name = {
+        let instances = state.connector_instances.read().await;
+        instances.iter().find(|c| c.id == id).map(|c| c.name.clone())
+    };
+
     sqlx::query!("DELETE FROM connector_instances WHERE id = $1", id)
         .execute(&state.db)
         .await
@@ -207,6 +228,12 @@ pub async fn delete_connector_instance(
     let event = common::ConnectorInstanceEvent::Deleted { id: id.clone() };
     publish_connector_instance_event(&state.nats, &event).await?;
 
+    let (uid, uemail) = user_info(&user);
+    let _ = state.audit_logger.log_success(
+        "connector_instance", &id, name.as_deref(), AuditAction::Delete,
+        uid, uemail, None, None,
+    ).await;
+
     tracing::info!("🗑️  Deleted connector instance: {}", id);
     Ok(Json(json!({ "deleted": id })))
 }
@@ -214,6 +241,7 @@ pub async fn delete_connector_instance(
 pub async fn update_connector_instance(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    user: Option<Extension<common::User>>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
     let name = payload["name"].as_str()
@@ -282,6 +310,12 @@ pub async fn update_connector_instance(
     if let Err(e) = publish_connector_instance_event(&state.nats, &event).await {
         tracing::warn!("Failed to publish connector update event: {}", e);
     }
+
+    let (uid, uemail) = user_info(&user);
+    let _ = state.audit_logger.log_success(
+        "connector_instance", &id, Some(&updated.name), AuditAction::Update,
+        uid, uemail, None, None,
+    ).await;
 
     tracing::info!("✏️ Updated connector instance: {}", updated.name);
 

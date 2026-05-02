@@ -140,8 +140,8 @@ impl ConnectorRegistry {
                 let host = resolve_host(raw_host);
                 let database = instance.database.as_deref().unwrap_or("");
                 let url = format!(
-                    "mssql://{}:{}@{}:{}/{}",
-                    username, password, host, port, database
+                    "Server=tcp:{},{};Database={};User Id={};Password={};TrustServerCertificate=true;",
+                    host, port, database, username, password
                 );
 
                 let mut conn = MssqlConnector::new(url);
