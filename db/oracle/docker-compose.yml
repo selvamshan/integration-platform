@@ -1,0 +1,29 @@
+services:
+  oracle-db:
+    image: gvenzl/oracle-free:23-slim
+    container_name: oracle-db
+    restart: unless-stopped
+    ports:
+      - "1521:1521"
+    environment:
+      ORACLE_PASSWORD: ${ORACLE_PASSWORD:-strongpassword}
+      APP_USER: ${APP_USER:-appuser}
+      APP_USER_PASSWORD: ${APP_USER_PASSWORD:-apppassword}
+    volumes:
+      - oracle_data:/opt/oracle/oradata
+      - ./init-scripts:/container-entrypoint-initdb.d
+    networks:
+      - oracle_net
+    healthcheck:
+      test: ["CMD", "healthcheck.sh"]
+      interval: 10s
+      timeout: 5s
+      retries: 10
+      start_period: 60s
+
+volumes:
+  oracle_data:
+
+networks:
+  oracle_net:
+    driver: bridge
