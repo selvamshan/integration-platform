@@ -68,6 +68,11 @@ pub async fn execute_flow(
         .map_err(|e| AppError::Internal(e.to_string()))
 }
 
+/// Public boolean wrapper used by middleware to check whether a trigger path matches.
+pub fn match_path_pattern_simple(pattern: &str, actual: &str) -> bool {
+    match_path_pattern(pattern, actual).is_some()
+}
+
 /// Match a parameterized pattern like `/users/:userId` against an actual path.
 fn match_path_pattern(pattern: &str, actual: &str) -> Option<HashMap<String, String>> {
     let pattern = pattern.trim_start_matches('/');

@@ -177,3 +177,190 @@ impl MssqlConnector {
         Ok(Message::new(json!({ "rows_affected": rows_affected })))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::Connector;
+    use serde_json::json;
+
+    fn make_msg(payload: serde_json::Value) -> Message {
+        Message::new(payload)
+    }
+
+    // ── normalize_placeholders unit tests ─────────────────────────────────────
+
+    #[test]
+    fn normalize_dollar_style_single() {
+        assert_eq!(
+            normalize_placeholders("SELECT * FROM t WHERE id = $1"),
+            "SELECT * FROM t WHERE id = @p1"
+        );
+    }
+
+    #[test]
+    fn normalize_dollar_style_multiple() {
+        assert_eq!(
+            normalize_placeholders("INSERT INTO t (a, b) VALUES ($1, $2)"),
+            "INSERT INTO t (a, b) VALUES (@p1, @p2)"
+        );
+    }
+
+    #[test]
+    fn normalize_question_mark_style() {
+        assert_eq!(
+            normalize_placeholders("INSERT INTO t (a, b) VALUES (?, ?)"),
+            "INSERT INTO t (a, b) VALUES (@p1, @p2)"
+        );
+    }
+
+    #[test]
+    fn normalize_mixed_style_increments_counter() {
+        // dollar style first, then question mark — counter must keep going
+        assert_eq!(
+            normalize_placeholders("WHERE a = $1 AND b = ?"),
+            "WHERE a = @p1 AND b = @p2"
+        );
+    }
+
+    #[test]
+    fn normalize_multi_digit_dollar_placeholder() {
+        assert_eq!(
+            normalize_placeholders("WHERE x = $10 AND y = $11"),
+            "WHERE x = @p1 AND y = @p2"
+        );
+    }
+
+    #[test]
+    fn normalize_no_placeholders_unchanged() {
+        let sql = "SELECT GETDATE()";
+        assert_eq!(normalize_placeholders(sql), sql);
+    }
+
+    // ── error path unit tests (no real DB) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_before_connect_returns_error() {
+        let c = MssqlConnector::new(
+            "Server=tcp:localhost,1433;Database=test;User Id=sa;Password=pass;TrustServerCertificate=true;".into()
+        );
+        let err = c.execute("query", make_msg(json!({"sql": "SELECT 1"}))).await.unwrap_err();
+        assert!(matches!(err, common::Error::Connector(_)));
+        assert!(err.to_string().contains("Not connected"));
+    }
+
+    #[tokio::test]
+    async fn execute_before_connect_returns_error() {
+        let c = MssqlConnector::new(
+            "Server=tcp:localhost,1433;Database=test;User Id=sa;Password=pass;TrustServerCertificate=true;".into()
+        );
+        let err = c.execute("execute", make_msg(json!({"sql": "SELECT 1"}))).await.unwrap_err();
+        assert!(matches!(err, common::Error::Connector(_)));
+    }
+
+    #[tokio::test]
+    async fn unknown_operation_returns_error() {
+        let c = MssqlConnector::new("dummy".into());
+        let err = c.execute("bad_op", make_msg(json!({}))).await.unwrap_err();
+        match err {
+            common::Error::Connector(msg) => assert!(msg.contains("Unknown operation")),
+            _ => panic!("expected Connector error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_without_connect_is_noop() {
+        let mut c = MssqlConnector::new("dummy".into());
+        c.disconnect().await.unwrap();
+    }
+
+    // ── integration tests (require TEST_MSSQL_URL env var) ───────────────────
+    // Connection string format (testdb created by docker-compose.test.yml init):
+    //   Server=tcp:localhost,1434;Database=testdb;User Id=sa;Password=Test@1234;TrustServerCertificate=true;
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_connect_and_ping() {
+        let cs = std::env::var("TEST_MSSQL_URL")
+            .expect("set TEST_MSSQL_URL to run integration tests");
+        let mut c = MssqlConnector::new(cs);
+        c.connect().await.unwrap();
+        let result = c.execute("query", make_msg(json!({"sql": "SELECT 1 AS val"}))).await.unwrap();
+        let rows = result.payload["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        c.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_missing_sql_param_returns_error() {
+        let cs = std::env::var("TEST_MSSQL_URL")
+            .expect("set TEST_MSSQL_URL to run integration tests");
+        let mut c = MssqlConnector::new(cs);
+        c.connect().await.unwrap();
+        let err = c.execute("query", make_msg(json!({}))).await.unwrap_err();
+        assert!(err.to_string().contains("Missing 'sql'"));
+        c.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_insert_select_delete() {
+        let cs = std::env::var("TEST_MSSQL_URL")
+            .expect("set TEST_MSSQL_URL to run integration tests");
+        let mut c = MssqlConnector::new(cs);
+        c.connect().await.unwrap();
+
+        // BIGINT matches the i64 bind_json produces; unique name avoids parallel collisions.
+        // MSSQL session-scoped #temp tables are dropped when the connection closes so
+        // we use a regular table name here and drop it explicitly.
+        let tbl = unique_table("ms_isd");
+        c.execute("execute", make_msg(json!({
+            "sql": format!("CREATE TABLE {tbl} (id BIGINT IDENTITY PRIMARY KEY, name NVARCHAR(100), age BIGINT)")
+        }))).await.unwrap();
+
+        let ins = c.execute("execute", make_msg(json!({
+            "sql": format!("INSERT INTO {tbl} (name, age) VALUES ($1, $2)"),
+            "params": ["Alice", 30]
+        }))).await.unwrap();
+        assert_eq!(ins.payload["rows_affected"], json!(1));
+
+        c.execute("execute", make_msg(json!({
+            "sql": format!("INSERT INTO {tbl} (name, age) VALUES (?, ?)"),
+            "params": ["Bob", 25]
+        }))).await.unwrap();
+
+        let result = c.execute("query", make_msg(json!({
+            "sql": format!("SELECT name, age FROM {tbl} WHERE age = $1"),
+            "params": [30]
+        }))).await.unwrap();
+        let rows = result.payload["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Alice");
+        assert_eq!(rows[0]["age"], json!(30));
+
+        let all = c.execute("query", make_msg(json!({
+            "sql": format!("SELECT name FROM {tbl} ORDER BY name")
+        }))).await.unwrap();
+        assert_eq!(all.payload["count"], json!(2));
+
+        let del = c.execute("execute", make_msg(json!({
+            "sql": format!("DELETE FROM {tbl} WHERE name = $1"),
+            "params": ["Bob"]
+        }))).await.unwrap();
+        assert_eq!(del.payload["rows_affected"], json!(1));
+
+        c.execute("execute", make_msg(json!({
+            "sql": format!("DROP TABLE {tbl}")
+        }))).await.unwrap();
+        c.disconnect().await.unwrap();
+    }
+}
+
+fn unique_table(prefix: &str) -> String {
+    let ns = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    format!("{prefix}_{ns}")
+}

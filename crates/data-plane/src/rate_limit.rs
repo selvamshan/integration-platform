@@ -36,11 +36,13 @@ pub async fn rate_limit_middleware(
         if parts.len() >= 3 { Some(parts[2].to_string()) } else { None }
     } else if path.starts_with("/api/trigger/") {
         let trigger_path = path.strip_prefix("/api/trigger/").unwrap_or("");
+        let method_str = request.method().as_str();
         let flows = state.flows.read().await;
         flows.values()
             .find(|f| {
                 if let common::Trigger::Http { path: p, method } = &f.trigger {
-                    method == "GET" && p.contains(trigger_path)
+                    method.to_uppercase() == method_str.to_uppercase()
+                        && crate::handlers::match_path_pattern_simple(p, trigger_path)
                 } else {
                     false
                 }

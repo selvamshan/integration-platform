@@ -140,7 +140,12 @@ export function ConnectorForm({ onSubmit, initialValues, isEdit = false }: Conne
               required
             />
           </div>
-          <input {...register('database_name')} placeholder="Database name" className="input" required />
+          <input
+            {...register('database_name')}
+            placeholder={connectorType === 'oracle' ? 'Service Name / SID (e.g. ORCL)' : 'Database name'}
+            className="input"
+            required
+          />
           <div className="grid grid-cols-2 gap-4">
             <input {...register('username')} placeholder="Username" className="input" required />
             <input

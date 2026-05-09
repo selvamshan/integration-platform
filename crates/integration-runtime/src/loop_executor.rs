@@ -180,7 +180,7 @@ mod tests {
         let result = executor.execute(
             "test",
             LoopType::Count { count: 5 },
-            &[],
+            LoopBody::Steps(&[]),
             message,
             &TestExecutor,
         ).await.unwrap();
@@ -196,7 +196,7 @@ mod tests {
         let result = executor.execute(
             "test",
             LoopType::ForEach { items_path: "{{items}}".to_string() },
-            &[],
+            LoopBody::Steps(&[]),
             message,
             &TestExecutor,
         ).await.unwrap();

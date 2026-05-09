@@ -1,0 +1,68 @@
+# Disposable databases for connector integration tests.
+#
+# Usage:
+#   docker compose -f docker-compose.test.yml up -d
+#   # wait for healthchecks to pass, then:
+#   TEST_POSTGRES_URL=postgresql://test:test@localhost:5433/testdb \
+#   TEST_MYSQL_URL=mysql://test:test@localhost:3307/testdb \
+#   TEST_MSSQL_URL="Server=tcp:localhost,1434;Database=testdb;User Id=sa;Password=Test@1234;TrustServerCertificate=true;" \
+#   cargo test -p integration-runtime -- --ignored
+#
+#   docker compose -f docker-compose.test.yml down -v
+
+services:
+  test-postgres:
+    image: postgres:15-alpine
+    container_name: test-postgres
+    environment:
+      POSTGRES_DB: testdb
+      POSTGRES_USER: test
+      POSTGRES_PASSWORD: test
+    ports:
+      - "5433:5432"
+    tmpfs:
+      - /var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U test -d testdb"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  test-mysql:
+    image: mysql:8.0
+    container_name: test-mysql
+    environment:
+      MYSQL_DATABASE: testdb
+      MYSQL_USER: test
+      MYSQL_PASSWORD: test
+      MYSQL_ROOT_PASSWORD: rootpass
+    ports:
+      - "3307:3306"
+    tmpfs:
+      - /var/lib/mysql
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-u", "test", "-ptest"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+
+  test-mssql:
+    image: mcr.microsoft.com/mssql/server:2022-latest
+    container_name: test-mssql
+    environment:
+      ACCEPT_EULA: "Y"
+      SA_PASSWORD: "Test@1234"
+    ports:
+      - "1434:1433"
+    # The init script starts sqlservr then creates the testdb database.
+    # The SQL Server image does not auto-create databases from env vars.
+    volumes:
+      - ./db/mssql/init-test.sh:/init-test.sh
+    entrypoint: ["/bin/bash", "/init-test.sh"]
+    healthcheck:
+      test: ["CMD-SHELL",
+             "/opt/mssql-tools18/bin/sqlcmd -S localhost -U sa -P 'Test@1234' -No -Q 'SELECT name FROM sys.databases WHERE name=''testdb''' | grep -q testdb"]
+      interval: 10s
+      timeout: 10s
+      retries: 15
+      start_period: 30s

@@ -197,3 +197,236 @@ impl OracleConnector {
         Ok(Message::new(json!({ "rows_affected": rows_affected })))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use common::Connector;
+    use serde_json::json;
+
+    fn make_msg(payload: serde_json::Value) -> Message {
+        Message::new(payload)
+    }
+
+    fn make_connector() -> OracleConnector {
+        OracleConnector::new("user".into(), "pass".into(), "//localhost/xe".into())
+    }
+
+    // ── normalize_placeholders unit tests ─────────────────────────────────────
+
+    #[test]
+    fn normalize_dollar_style_preserves_number() {
+        assert_eq!(
+            normalize_placeholders("SELECT * FROM t WHERE id = $1"),
+            "SELECT * FROM t WHERE id = :1"
+        );
+    }
+
+    #[test]
+    fn normalize_dollar_style_multiple_preserves_numbers() {
+        assert_eq!(
+            normalize_placeholders("INSERT INTO t (a, b) VALUES ($1, $2)"),
+            "INSERT INTO t (a, b) VALUES (:1, :2)"
+        );
+    }
+
+    #[test]
+    fn normalize_question_mark_sequential_counter() {
+        assert_eq!(
+            normalize_placeholders("INSERT INTO t (a, b) VALUES (?, ?)"),
+            "INSERT INTO t (a, b) VALUES (:1, :2)"
+        );
+    }
+
+    #[test]
+    fn normalize_dollar_style_does_not_use_counter() {
+        // dollar style keeps the original number, not the sequential counter
+        assert_eq!(
+            normalize_placeholders("WHERE x = $3 AND y = $1"),
+            "WHERE x = :3 AND y = :1"
+        );
+    }
+
+    #[test]
+    fn normalize_no_placeholders_unchanged() {
+        let sql = "SELECT 1 FROM DUAL";
+        assert_eq!(normalize_placeholders(sql), sql);
+    }
+
+    #[test]
+    fn normalize_multi_digit_dollar_placeholder() {
+        assert_eq!(
+            normalize_placeholders("WHERE x = $10"),
+            "WHERE x = :10"
+        );
+    }
+
+    // ── value_to_bind_string unit tests ───────────────────────────────────────
+
+    #[test]
+    fn bind_string_from_string() {
+        assert_eq!(value_to_bind_string(&json!("hello")), "hello");
+    }
+
+    #[test]
+    fn bind_string_from_integer() {
+        assert_eq!(value_to_bind_string(&json!(42)), "42");
+    }
+
+    #[test]
+    fn bind_string_from_float() {
+        assert_eq!(value_to_bind_string(&json!(3.14)), "3.14");
+    }
+
+    #[test]
+    fn bind_string_from_bool_true() {
+        assert_eq!(value_to_bind_string(&json!(true)), "1");
+    }
+
+    #[test]
+    fn bind_string_from_bool_false() {
+        assert_eq!(value_to_bind_string(&json!(false)), "0");
+    }
+
+    #[test]
+    fn bind_string_from_null() {
+        assert_eq!(value_to_bind_string(&json!(null)), "");
+    }
+
+    #[test]
+    fn bind_string_from_object_serialized() {
+        let val = json!({"k": "v"});
+        assert_eq!(value_to_bind_string(&val), val.to_string());
+    }
+
+    // ── error path unit tests (no real DB) ────────────────────────────────────
+
+    #[tokio::test]
+    async fn query_before_connect_returns_error() {
+        let c = make_connector();
+        let err = c.execute("query", make_msg(json!({"sql": "SELECT 1 FROM DUAL"}))).await.unwrap_err();
+        match &err {
+            common::Error::Connector(msg) => assert!(msg.contains("Not connected")),
+            _ => panic!("expected Connector error, got: {}", err),
+        }
+    }
+
+    #[tokio::test]
+    async fn execute_before_connect_returns_error() {
+        let c = make_connector();
+        let err = c.execute("execute", make_msg(json!({"sql": "BEGIN NULL; END;"}))).await.unwrap_err();
+        assert!(matches!(err, common::Error::Connector(_)));
+        assert!(err.to_string().contains("Not connected"));
+    }
+
+    #[tokio::test]
+    async fn unknown_operation_returns_error() {
+        let c = make_connector();
+        let err = c.execute("bad_op", make_msg(json!({}))).await.unwrap_err();
+        match err {
+            common::Error::Connector(msg) => assert!(msg.contains("Unknown operation")),
+            _ => panic!("expected Connector error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn disconnect_without_connect_is_noop() {
+        let mut c = make_connector();
+        c.disconnect().await.unwrap();
+        assert!(!c.connected);
+    }
+
+    // ── integration tests (require Oracle Instant Client + running Oracle DB) ──
+    // Install Oracle Instant Client first:  https://oracle.github.io/odpi/doc/installation.html#linux
+    // Then set env vars:
+    //   TEST_ORACLE_USER=system
+    //   TEST_ORACLE_PASS=oracle
+    //   TEST_ORACLE_CS=//localhost:1521/XE
+    //
+    // If Oracle Instant Client is not installed the tests skip automatically.
+
+    /// Returns true when Oracle Instant Client is missing; the test should return early.
+    async fn oracle_client_missing(c: &mut OracleConnector) -> bool {
+        match c.connect().await {
+            Ok(()) => false,
+            Err(e) if e.to_string().contains("DPI-1047") => {
+                println!("SKIP — Oracle Instant Client not installed: {e}");
+                true
+            }
+            Err(e) => panic!("unexpected connect error: {e}"),
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_connect_and_ping() {
+        let user = std::env::var("TEST_ORACLE_USER").expect("set TEST_ORACLE_USER");
+        let pass = std::env::var("TEST_ORACLE_PASS").expect("set TEST_ORACLE_PASS");
+        let cs   = std::env::var("TEST_ORACLE_CS").expect("set TEST_ORACLE_CS");
+        let mut c = OracleConnector::new(user, pass, cs);
+        if oracle_client_missing(&mut c).await { return; }
+        let result = c.execute("query", make_msg(json!({"sql": "SELECT 1 AS val FROM DUAL"}))).await.unwrap();
+        let rows = result.payload["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        c.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_missing_sql_param_returns_error() {
+        let user = std::env::var("TEST_ORACLE_USER").expect("set TEST_ORACLE_USER");
+        let pass = std::env::var("TEST_ORACLE_PASS").expect("set TEST_ORACLE_PASS");
+        let cs   = std::env::var("TEST_ORACLE_CS").expect("set TEST_ORACLE_CS");
+        let mut c = OracleConnector::new(user, pass, cs);
+        if oracle_client_missing(&mut c).await { return; }
+        let err = c.execute("query", make_msg(json!({}))).await.unwrap_err();
+        assert!(err.to_string().contains("Missing 'sql'"));
+        c.disconnect().await.unwrap();
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn integration_insert_select_delete() {
+        let user = std::env::var("TEST_ORACLE_USER").expect("set TEST_ORACLE_USER");
+        let pass = std::env::var("TEST_ORACLE_PASS").expect("set TEST_ORACLE_PASS");
+        let cs   = std::env::var("TEST_ORACLE_CS").expect("set TEST_ORACLE_CS");
+        let mut c = OracleConnector::new(user.clone(), pass.clone(), cs.clone());
+        if oracle_client_missing(&mut c).await { return; }
+
+        // create a test table (global temporary for session scope)
+        c.execute("execute", make_msg(json!({
+            "sql": "CREATE GLOBAL TEMPORARY TABLE ora_conn_test (id NUMBER GENERATED ALWAYS AS IDENTITY, name VARCHAR2(100), age NUMBER) ON COMMIT PRESERVE ROWS"
+        }))).await.ok(); // may already exist from a previous run
+
+        let ins = c.execute("execute", make_msg(json!({
+            "sql": "INSERT INTO ora_conn_test (name, age) VALUES ($1, $2)",
+            "params": ["Alice", "30"]
+        }))).await.unwrap();
+        assert_eq!(ins.payload["rows_affected"], json!(1));
+
+        c.execute("execute", make_msg(json!({
+            "sql": "INSERT INTO ora_conn_test (name, age) VALUES (?, ?)",
+            "params": ["Bob", "25"]
+        }))).await.unwrap();
+
+        let result = c.execute("query", make_msg(json!({
+            "sql": "SELECT name, age FROM ora_conn_test WHERE age = $1",
+            "params": ["30"]
+        }))).await.unwrap();
+        let rows = result.payload["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "Alice");
+
+        let all = c.execute("query", make_msg(json!({
+            "sql": "SELECT name FROM ora_conn_test ORDER BY name"
+        }))).await.unwrap();
+        assert_eq!(all.payload["count"], json!(2));
+
+        c.execute("execute", make_msg(json!({
+            "sql": "DELETE FROM ora_conn_test WHERE name = $1",
+            "params": ["Bob"]
+        }))).await.unwrap();
+
+        c.disconnect().await.unwrap();
+    }
+}
