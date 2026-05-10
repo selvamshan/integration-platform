@@ -4,6 +4,7 @@ import { Dashboard } from './pages/Dashboard'
 import { Projects } from './pages/Projects'
 import { Flows } from './pages/Flows'
 import { FlowEditor } from './pages/FlowEditor'
+import { FlowRunsView } from './pages/FlowRunsView'
 import { Connectors } from './pages/Connectors'
 import { AuditLogs } from './pages/AuditLogs'
 import { Setup } from './pages/Setup'
@@ -49,6 +50,7 @@ function App() {
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="flows" element={<Flows />} />
           <Route path="flows/:id" element={<FlowEditor />} />
+          <Route path="flows/:id/runs" element={<FlowRunsView />} />
           <Route path="connectors" element={<Connectors />} />
           <Route path="audit-logs" element={<AuditLogs />} />
           <Route path="users" element={<Users />} />

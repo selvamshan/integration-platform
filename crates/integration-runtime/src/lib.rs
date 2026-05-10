@@ -10,6 +10,7 @@ pub mod templates;
 pub mod graph_executor;
 
 pub use loop_executor::{LoopExecutor, LoopType};
+pub use graph_executor::NodeRunResult;
 
 use loop_executor::{StepExecutor, LoopType as LT, LoopBody};
 use templates::{resolve_templates, resolve_template_str};
@@ -52,6 +53,31 @@ impl FlowExecutor {
         };
         info!("✅ Flow completed: {}", flow.name);
         Ok(result)
+    }
+
+    /// Execute a flow and capture per-node results for run history.
+    pub async fn execute_flow_with_results<'a>(
+        &'a self,
+        flow: &'a FlowDefinition,
+        input: Message,
+    ) -> (Result<Message>, Vec<NodeRunResult>) {
+        info!("🚀 Executing flow (with results): {}", flow.name);
+        if flow.is_graph_flow() {
+            info!("   mode: graph ({} nodes, {} edges)", flow.nodes.len(), flow.edges.len());
+            let (result, node_results) = graph_executor::execute_graph_with_node_results(
+                flow,
+                input,
+                |node, msg| Box::pin(self.execute_step(&node.step, msg)),
+            ).await;
+            if result.is_ok() {
+                info!("✅ Flow completed: {}", flow.name);
+            }
+            (result, node_results)
+        } else {
+            info!("   mode: linear ({} steps)", flow.steps.len());
+            let result = self.execute_steps(&flow.steps, input).await;
+            (result, vec![])
+        }
     }
 
     /// Execute a sequence of steps, threading the message through each one.

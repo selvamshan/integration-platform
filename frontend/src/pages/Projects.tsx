@@ -210,11 +210,11 @@ export function Projects() {
                           </div>
                           <div className="flex items-center gap-2">
                             <button
-                              onClick={() => navigate(`/flows/${flow.id}`)}
+                              onClick={() => navigate(`/flows/${flow.id}/runs`)}
                               className="btn btn-secondary flex items-center gap-1.5 text-sm"
                             >
                               <Pencil className="w-3.5 h-3.5" />
-                              Edit
+                              Open
                             </button>
                           </div>
                         </div>

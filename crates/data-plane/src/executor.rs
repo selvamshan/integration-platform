@@ -12,7 +12,7 @@ use crate::metrics::{
     FLOW_EXECUTION_DURATION, FLOW_EXECUTIONS_FAILED, FLOW_EXECUTIONS_SUCCESS,
     FLOW_EXECUTIONS_TOTAL, RETRY_ATTEMPTS_TOTAL, RETRY_EXHAUSTED_TOTAL, RETRY_SUCCESS_TOTAL,
 };
-use crate::state::AppState;
+use crate::state::{AppState, FlowRunRecord};
 
 pub async fn execute_with_retry<F, Fut>(
     retry_policy: &common::RetryPolicy,
@@ -103,6 +103,7 @@ pub async fn execute_flow_inner(state: &Arc<AppState>, flow_id: &str, payload: V
     tracing::info!("📨 Executing flow: {}", flow_id);
 
     FLOW_EXECUTIONS_TOTAL.inc();
+    let started_at = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
 
     let flow = {
@@ -118,11 +119,11 @@ pub async fn execute_flow_inner(state: &Arc<AppState>, flow_id: &str, payload: V
     let retry_policy = flow.retry.clone();
     let input = Message::new(payload);
 
-    let result = if let Some(ref policy) = retry_policy {
+    let (result, node_results) = if let Some(ref policy) = retry_policy {
         let executor   = state.executor.clone();
         let flow_clone = flow.clone();
         let input_clone = input.clone();
-        execute_with_retry(policy, flow_id, move || {
+        let res = execute_with_retry(policy, flow_id, move || {
             let executor    = executor.clone();
             let flow        = flow_clone.clone();
             let input       = input_clone.clone();
@@ -130,14 +131,37 @@ pub async fn execute_flow_inner(state: &Arc<AppState>, flow_id: &str, payload: V
                 let executor = executor.read().await;
                 executor.execute_flow(&flow, input).await
             }
-        }).await
+        }).await;
+        // For the retry path, per-node results are not available
+        (res, vec![])
     } else {
         let executor = state.executor.read().await;
-        executor.execute_flow(&flow, input).await
+        executor.execute_flow_with_results(&flow, input).await
     };
 
     let duration = start.elapsed().as_secs_f64();
+    let duration_ms = (duration * 1000.0) as u64;
     FLOW_EXECUTION_DURATION.observe(duration);
+
+    // Store run record regardless of success/failure
+    let run_record = FlowRunRecord {
+        run_id:       uuid::Uuid::new_v4().to_string(),
+        flow_id:      flow_id.to_string(),
+        flow_name:    flow.name.clone(),
+        started_at,
+        duration_ms,
+        success:      result.is_ok(),
+        error:        result.as_ref().err().map(|e| e.to_string()),
+        node_results,
+    };
+    {
+        let mut history = state.run_history.write().await;
+        let runs = history.entry(flow_id.to_string()).or_default();
+        runs.push_front(run_record);
+        while runs.len() > 10 {
+            runs.pop_back();
+        }
+    }
 
     match result {
         Ok(output) => {

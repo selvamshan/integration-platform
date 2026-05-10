@@ -41,6 +41,12 @@ function formatTime(iso: string) {
   })
 }
 
+const TABS = [
+  { label: 'All',        value: '' },
+  { label: 'Flows',      value: 'flow' },
+  { label: 'Connectors', value: 'connector_instance' },
+]
+
 export function AuditLogs() {
   const [searchParams, setSearchParams] = useSearchParams()
 
@@ -53,6 +59,11 @@ export function AuditLogs() {
   const [entityId, setEntityId]     = useState(searchParams.get('entity_id') ?? '')
   const [userId, setUserId]         = useState(searchParams.get('user_id') ?? '')
   const [limit, setLimit]           = useState(Number(searchParams.get('limit') ?? 50))
+
+  const applyTab = (value: string) => {
+    setEntityType(value)
+    setEntityId('')
+  }
 
   const fetchLogs = useCallback(async () => {
     setLoading(true)
@@ -106,7 +117,7 @@ export function AuditLogs() {
 
   return (
     <div>
-      <div className="flex justify-between items-center mb-6">
+      <div className="flex justify-between items-center mb-4">
         <div>
           <h1 className="text-3xl font-bold">Audit Logs</h1>
           {entityLabel && entityId && (
@@ -116,6 +127,23 @@ export function AuditLogs() {
           )}
         </div>
         <span className="text-sm text-gray-500">{count} record{count !== 1 ? 's' : ''}</span>
+      </div>
+
+      {/* Quick-filter tabs */}
+      <div className="flex gap-1 mb-5 border-b border-gray-200">
+        {TABS.map((tab) => (
+          <button
+            key={tab.value}
+            onClick={() => applyTab(tab.value)}
+            className={`px-4 py-2 text-sm font-medium border-b-2 transition-colors -mb-px ${
+              entityType === tab.value
+                ? 'border-primary-600 text-primary-600'
+                : 'border-transparent text-gray-500 hover:text-gray-800'
+            }`}
+          >
+            {tab.label}
+          </button>
+        ))}
       </div>
 
       {/* Filters */}
@@ -258,7 +286,7 @@ function EntityLink({ entityType, entityId }: { entityType: string; entityId: st
   if (entityType === 'flow') {
     return (
       <Link
-        to={`/flows/${entityId}`}
+        to={`/flows/${entityId}/runs`}
         className="text-xs text-primary-600 hover:underline font-mono"
       >
         {short}

@@ -1,10 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use tokio::sync::RwLock;
 use async_nats::Client as NatsClient;
+use serde::Serialize;
 
 use common::{CircuitState, FlowDefinition};
-use integration_runtime::FlowExecutor;
+use integration_runtime::{FlowExecutor, NodeRunResult};
 
 use crate::connector_registry::ConnectorRegistry;
 use crate::scheduler::FlowScheduler;
@@ -32,6 +33,18 @@ impl CircuitBreakerState {
     }
 }
 
+#[derive(Debug, Clone, Serialize)]
+pub struct FlowRunRecord {
+    pub run_id: String,
+    pub flow_id: String,
+    pub flow_name: String,
+    pub started_at: String,
+    pub duration_ms: u64,
+    pub success: bool,
+    pub error: Option<String>,
+    pub node_results: Vec<NodeRunResult>,
+}
+
 pub struct AppState {
     pub executor:           Arc<RwLock<FlowExecutor>>,
     pub flows:              Arc<RwLock<HashMap<String, FlowDefinition>>>,
@@ -42,4 +55,5 @@ pub struct AppState {
     pub node_id:            String,
     pub jwt_secret:         String,
     pub scheduler:          Arc<FlowScheduler>,
+    pub run_history:        Arc<RwLock<HashMap<String, VecDeque<FlowRunRecord>>>>,
 }

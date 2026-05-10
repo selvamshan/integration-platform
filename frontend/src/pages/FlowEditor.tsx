@@ -21,10 +21,12 @@ export function FlowEditor() {
     }
   }, [id, isNew])
 
+  const backTo = isNew ? '/projects' : `/flows/${id}/runs`
+
   return (
     <div>
       <div className="flex items-center gap-4 mb-6">
-        <Link to="/flows" className="text-gray-500 hover:text-gray-800">
+        <Link to={backTo} className="text-gray-500 hover:text-gray-800">
           <ArrowLeft className="w-5 h-5" />
         </Link>
         <h1 className="text-3xl font-bold">{isNew ? 'Create Flow' : 'Edit Flow'}</h1>

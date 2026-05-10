@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::time::Instant;
 use common::{Error, FlowDefinition, FlowEdge, FlowNode, EdgeCondition, Message, Result};
 use tracing::{info, warn};
 
@@ -9,6 +10,16 @@ use crate::templates::evaluate_condition;
 pub enum StepOutcome {
     Success,
     Failure,
+}
+
+/// Per-node execution result captured during a flow run.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct NodeRunResult {
+    pub node_id: String,
+    pub success: bool,
+    pub error: Option<String>,
+    pub duration_ms: u64,
+    pub output: Option<serde_json::Value>,
 }
 
 /// Execute a flow using the graph (DAG) executor.
@@ -22,10 +33,53 @@ where
     F: Fn(&'a FlowNode, Message) -> Fut,
     Fut: std::future::Future<Output = Result<Message>> + 'a,
 {
-    execute_graph_nodes(&flow.nodes, &flow.edges, input, execute_node).await
+    let (result, _) = execute_graph_nodes_inner(&flow.nodes, &flow.edges, input, execute_node).await;
+    result
+}
+
+/// Execute a flow and return per-node execution results alongside the final message.
+pub async fn execute_graph_with_node_results<'a, F, Fut>(
+    flow: &'a FlowDefinition,
+    input: Message,
+    execute_node: F,
+) -> (Result<Message>, Vec<NodeRunResult>)
+where
+    F: Fn(&'a FlowNode, Message) -> Fut,
+    Fut: std::future::Future<Output = Result<Message>> + 'a,
+{
+    execute_graph_nodes_inner(&flow.nodes, &flow.edges, input, execute_node).await
 }
 
 /// Execute a DAG expressed as bare node and edge slices.
+pub async fn execute_graph_nodes<'a, F, Fut>(
+    nodes: &'a [FlowNode],
+    edges: &'a [FlowEdge],
+    input: Message,
+    execute_node: F,
+) -> Result<Message>
+where
+    F: Fn(&'a FlowNode, Message) -> Fut,
+    Fut: std::future::Future<Output = Result<Message>> + 'a,
+{
+    let (result, _) = execute_graph_nodes_inner(nodes, edges, input, execute_node).await;
+    result
+}
+
+/// Execute a DAG and also return per-node execution results.
+pub async fn execute_graph_nodes_with_results<'a, F, Fut>(
+    nodes: &'a [FlowNode],
+    edges: &'a [FlowEdge],
+    input: Message,
+    execute_node: F,
+) -> (Result<Message>, Vec<NodeRunResult>)
+where
+    F: Fn(&'a FlowNode, Message) -> Fut,
+    Fut: std::future::Future<Output = Result<Message>> + 'a,
+{
+    execute_graph_nodes_inner(nodes, edges, input, execute_node).await
+}
+
+/// Core DAG execution. Always collects per-node results.
 ///
 /// Algorithm:
 ///   1. Build in-degree map and adjacency list from `edges`.
@@ -38,18 +92,18 @@ where
 ///   5. Repeat until the queue is empty.
 ///   6. Return the message produced by the last node to execute (or the
 ///      input message if no nodes ran).
-pub async fn execute_graph_nodes<'a, F, Fut>(
+async fn execute_graph_nodes_inner<'a, F, Fut>(
     nodes: &'a [FlowNode],
     edges: &'a [FlowEdge],
     input: Message,
     execute_node: F,
-) -> Result<Message>
+) -> (Result<Message>, Vec<NodeRunResult>)
 where
     F: Fn(&'a FlowNode, Message) -> Fut,
     Fut: std::future::Future<Output = Result<Message>> + 'a,
 {
     if nodes.is_empty() {
-        return Ok(input);
+        return (Ok(input), vec![]);
     }
 
     // Index nodes by id
@@ -83,8 +137,9 @@ where
     // Outcomes for edge-condition evaluation
     let mut outcomes: HashMap<&str, StepOutcome> = HashMap::new();
     // Track the last node error; never cleared by a subsequent node's success.
-    // A node failure always propagates unless the flow has no more nodes to run.
     let mut last_error: Option<Error> = None;
+    // Per-node run results
+    let mut node_results: Vec<NodeRunResult> = Vec::new();
 
     // Seed queue with root nodes (in-degree 0)
     let mut queue: VecDeque<&str> = nodes
@@ -105,24 +160,38 @@ where
         };
 
         // Use the last output reaching this node as its input.
-        // For fan-in nodes we could merge; for now we use the most-recent predecessor output.
         let node_input = outputs
             .get(node_id)
             .cloned()
             .unwrap_or_else(|| last_output.clone());
 
         info!("graph_executor: executing node '{}'", node_id);
-        let (node_output, outcome) = match execute_node(node, node_input).await {
+        let t0 = Instant::now();
+        let (node_output, outcome, node_error) = match execute_node(node, node_input).await {
             Ok(msg) => {
                 info!("graph_executor: node '{}' succeeded", node_id);
-                (msg, StepOutcome::Success)
+                (msg, StepOutcome::Success, None)
             }
             Err(e) => {
                 warn!("graph_executor: node '{}' failed: {}", node_id, e);
+                let err_str = e.to_string();
                 last_error = Some(e);
-                (last_output.clone(), StepOutcome::Failure)
+                (last_output.clone(), StepOutcome::Failure, Some(err_str))
             }
         };
+        let duration_ms = t0.elapsed().as_millis() as u64;
+
+        node_results.push(NodeRunResult {
+            node_id: node_id.to_string(),
+            success: outcome == StepOutcome::Success,
+            error: node_error,
+            duration_ms,
+            output: if outcome == StepOutcome::Success {
+                Some(node_output.payload.clone())
+            } else {
+                None
+            },
+        });
 
         last_output = node_output.clone();
         outputs.insert(node_id, node_output.clone());
@@ -133,14 +202,11 @@ where
         for edge in edges {
             let traverse = should_traverse(edge, &outcome, &node_output);
             if !traverse {
-                // Edge not taken — count it as resolved so fan-in can still fire
-                // if all other predecessors do traverse.
                 *resolved_in.entry(edge.to.as_str()).or_default() += 1;
                 continue;
             }
 
             has_active_predecessor.insert(edge.to.as_str());
-            // Propagate the output to the target (last writer wins for fan-in)
             outputs.insert(edge.to.as_str(), node_output.clone());
 
             let resolved = {
@@ -149,7 +215,6 @@ where
                 *r
             };
 
-            // Enqueue when all predecessors have been processed
             if resolved >= in_degree[edge.to.as_str()] {
                 if has_active_predecessor.contains(edge.to.as_str()) {
                     queue.push_back(edge.to.as_str());
@@ -159,9 +224,9 @@ where
     }
 
     if let Some(e) = last_error {
-        return Err(e);
+        return (Err(e), node_results);
     }
-    Ok(last_output)
+    (Ok(last_output), node_results)
 }
 
 fn should_traverse(edge: &FlowEdge, outcome: &StepOutcome, output: &Message) -> bool {

@@ -22,6 +22,25 @@ export interface TestFlowResult {
   }
 }
 
+export interface NodeRunResult {
+  node_id: string
+  success: boolean
+  error?: string
+  duration_ms: number
+  output?: any
+}
+
+export interface FlowRunRecord {
+  run_id: string
+  flow_id: string
+  flow_name: string
+  started_at: string
+  duration_ms: number
+  success: boolean
+  error?: string
+  node_results: NodeRunResult[]
+}
+
 export const flowService = {
   async list() {
     const res = await api.get<{ flows: Flow[] }>('/flows')
@@ -50,5 +69,12 @@ export const flowService = {
   async test(flow: Omit<Flow, 'active'>, testInput?: any): Promise<TestFlowResult> {
     const res = await api.post<TestFlowResult>('/flows/test', { flow, test_input: testInput ?? {} })
     return res.data
+  },
+
+  async getRuns(flowId: string): Promise<{ runs: FlowRunRecord[] }> {
+    const dataplaneUrl = import.meta.env.VITE_DATA_PLANE_URL || 'http://localhost:8080'
+    const res = await fetch(`${dataplaneUrl}/flows/${flowId}/runs`)
+    if (!res.ok) throw new Error(`Data-plane returned ${res.status}`)
+    return res.json()
   },
 }

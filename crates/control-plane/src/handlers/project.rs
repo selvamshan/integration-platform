@@ -131,10 +131,17 @@ pub async fn list_project_flows(
         return Err(AppError::NotFound("Project not found".to_string()));
     }
 
-    let flows = state.flows.read().await;
-    let project_flows: Vec<_> = flows.iter()
-        .filter(|f| f.project_id.as_deref() == Some(id.as_str()))
+    let rows = sqlx::query(
+        "SELECT config FROM flow_definitions WHERE project_id = $1 ORDER BY created_at DESC"
+    )
+    .bind(pid)
+    .fetch_all(&state.db)
+    .await
+    .map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
+
+    let flows: Vec<serde_json::Value> = rows.iter()
+        .filter_map(|r| r.try_get::<serde_json::Value, _>("config").ok())
         .collect();
 
-    Ok(Json(json!({ "flows": project_flows, "count": project_flows.len() })))
+    Ok(Json(json!({ "flows": flows, "count": flows.len() })))
 }

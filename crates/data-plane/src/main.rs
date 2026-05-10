@@ -31,7 +31,7 @@ mod state;
 use auth::{auth_middleware, AuthConfig};
 use circuit_breaker::{circuit_breaker_middleware, circuit_breaker_status};
 use connector_registry::{ConnectorRegistry, CryptoService};
-use handlers::{execute_flow, health_check, list_flows, root, trigger_flow};
+use handlers::{execute_flow, get_flow_runs, health_check, list_flows, root, trigger_flow};
 use metrics::{metrics_handler, metrics_middleware, register_metrics};
 use rate_limit::rate_limit_middleware;
 use scheduler::FlowScheduler;
@@ -136,6 +136,7 @@ async fn main() -> Result<()> {
         node_id:            node_id.clone(),
         jwt_secret:         jwt_secret.clone(),
         scheduler,
+        run_history:        Arc::new(RwLock::new(HashMap::new())),
     });
 
     load_scheduled_flows(&state).await?;
@@ -177,18 +178,19 @@ async fn main() -> Result<()> {
         .allow_credentials(true);
 
     let protected = Router::new()
-        .route("/flows/:flow_id/execute", post(execute_flow))
+        .route("/flows/:flow_name/execute", post(execute_flow))
         .route("/api/trigger/*path", get(trigger_flow).post(trigger_flow).put(trigger_flow).delete(trigger_flow))
         .layer(middleware::from_fn_with_state(state.clone(), circuit_breaker_middleware))
         .layer(middleware::from_fn_with_state(state.clone(), rate_limit_middleware))
         .layer(middleware::from_fn_with_state(auth_cfg, auth_middleware));
 
     let public = Router::new()
-        .route("/",                get(root))
-        .route("/health",          get(health_check))
-        .route("/metrics",         get(metrics_handler))
-        .route("/circuit-breakers", get(circuit_breaker_status))
-        .route("/flows",           get(list_flows));
+        .route("/",                       get(root))
+        .route("/health",                 get(health_check))
+        .route("/metrics",                get(metrics_handler))
+        .route("/circuit-breakers",       get(circuit_breaker_status))
+        .route("/flows",                  get(list_flows))
+        .route("/flows/:flow_id/runs",    get(get_flow_runs));
 
     let scheduler_handle = state.scheduler.clone();
 

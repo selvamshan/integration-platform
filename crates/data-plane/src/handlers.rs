@@ -18,7 +18,7 @@ use crate::metrics::{
     FLOW_EXECUTION_DURATION, FLOW_EXECUTIONS_FAILED, FLOW_EXECUTIONS_SUCCESS,
     FLOW_EXECUTIONS_TOTAL,
 };
-use crate::state::AppState;
+use crate::state::{AppState, FlowRunRecord};
 
 pub async fn root() -> &'static str {
     "Data Plane - Integration Platform with Event Subscription"
@@ -42,25 +42,40 @@ pub async fn list_flows(State(state): State<Arc<AppState>>) -> Json<Value> {
     }))
 }
 
+pub async fn get_flow_runs(
+    State(state): State<Arc<AppState>>,
+    Path(flow_id): Path<String>,
+) -> Json<Value> {
+    let history = state.run_history.read().await;
+    let runs: Vec<serde_json::Value> = history
+        .get(&flow_id)
+        .map(|deque| deque.iter().map(|r| serde_json::to_value(r).unwrap_or_default()).collect())
+        .unwrap_or_default();
+    Json(json!({ "runs": runs, "flow_id": flow_id }))
+}
+
 pub async fn execute_flow(
     State(state): State<Arc<AppState>>,
     Extension(principal): Extension<AuthPrincipal>,
-    Path(flow_id): Path<String>,
+    Path(flow_name): Path<String>,
     Json(payload): Json<Value>,
 ) -> Result<Json<Value>, AppError> {
-    // Enforce client ownership: if the flow has a client_id it must match the caller.
-    {
+    let flow_id = {
         let flows = state.flows.read().await;
-        if let Some(flow) = flows.get(&flow_id) {
-            if let Some(owner) = &flow.client_id {
-                if *owner != principal.client_id {
-                    return Err(AppError::Forbidden(
-                        "This flow does not belong to your client".to_string(),
-                    ));
-                }
+        let flow = flows
+            .values()
+            .find(|f| f.name == flow_name)
+            .ok_or_else(|| AppError::NotFound(format!("Flow not found: {}", flow_name)))?;
+
+        if let Some(owner) = &flow.client_id {
+            if *owner != principal.client_id {
+                return Err(AppError::Forbidden(
+                    "This flow does not belong to your client".to_string(),
+                ));
             }
         }
-    }
+        flow.id.clone()
+    };
 
     execute_flow_inner(&state, &flow_id, payload)
         .await
@@ -171,13 +186,14 @@ pub async fn trigger_flow(
 
     let input = Message::new(payload);
     FLOW_EXECUTIONS_TOTAL.inc();
+    let started_at = chrono::Utc::now().to_rfc3339();
     let start = Instant::now();
 
-    let result = if let Some(ref policy) = retry_policy {
+    let (result, node_results) = if let Some(ref policy) = retry_policy {
         let executor    = state.executor.clone();
         let flow_clone  = flow.clone();
         let input_clone = input.clone();
-        execute_with_retry(policy, &flow_id, move || {
+        let res = execute_with_retry(policy, &flow_id, move || {
             let executor = executor.clone();
             let flow     = flow_clone.clone();
             let input    = input_clone.clone();
@@ -185,14 +201,36 @@ pub async fn trigger_flow(
                 let executor = executor.read().await;
                 executor.execute_flow(&flow, input).await
             }
-        }).await
+        }).await;
+        (res, vec![])
     } else {
         let executor = state.executor.read().await;
-        executor.execute_flow(&flow, input).await
+        executor.execute_flow_with_results(&flow, input).await
     };
 
     let duration = start.elapsed().as_secs_f64();
+    let duration_ms = (duration * 1000.0) as u64;
     FLOW_EXECUTION_DURATION.observe(duration);
+
+    // Record run in history
+    let run_record = FlowRunRecord {
+        run_id:       uuid::Uuid::new_v4().to_string(),
+        flow_id:      flow_id.clone(),
+        flow_name:    flow.name.clone(),
+        started_at,
+        duration_ms,
+        success:      result.is_ok(),
+        error:        result.as_ref().err().map(|e| e.to_string()),
+        node_results,
+    };
+    {
+        let mut history = state.run_history.write().await;
+        let runs = history.entry(flow_id.clone()).or_default();
+        runs.push_front(run_record);
+        while runs.len() > 10 {
+            runs.pop_back();
+        }
+    }
 
     match result {
         Ok(output) => {

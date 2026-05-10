@@ -104,8 +104,9 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
   const [showYaml, setShowYaml] = useState(false)
   const [yamlText, setYamlText] = useState('')
   const [copied, setCopied] = useState(false)
-  const [flowName, setFlowName] = useState('My Flow')
-  const [customFlowId, setCustomFlowId] = useState('')
+  const [flowName, setFlowName] = useState('')
+  const [nameError, setNameError] = useState<string | null>(null)
+  const [existingFlows, setExistingFlows] = useState<Flow[]>([])
   const [clientId, setClientId] = useState<string>('')
   const [clients, setClients] = useState<{ client_id: string; name: string; active: boolean }[]>([])
   const [saving, setSaving] = useState(false)
@@ -251,6 +252,13 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
   useEffect(() => {
     api.get('/auth/clients')
       .then((res) => setClients(res.data.clients ?? []))
+      .catch(() => {})
+  }, [])
+
+  // ── Load existing flows for uniqueness check ──────────────────────────────
+  useEffect(() => {
+    flowService.list()
+      .then((d) => setExistingFlows(d.flows ?? []))
       .catch(() => {})
   }, [])
 
@@ -535,7 +543,7 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
       }))
 
     return {
-      id: flowId || customFlowId.trim() || generatedId.current,
+      id: flowId || generatedId.current,
       name: flowName,
       ...(clientId ? { client_id: clientId } : {}),
       trigger,
@@ -543,10 +551,15 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
       edges: flowEdges,
       ...(rateLimit ? { rate_limit: rateLimit } : {}),
     }
-  }, [nodes, edges, flowId, flowName, customFlowId, clientId])
+  }, [nodes, edges, flowId, flowName, clientId])
 
   // ── Save ──────────────────────────────────────────────────────────────────
   const handleSave = async () => {
+    if (nameError) return
+    if (!flowName.trim()) {
+      setNameError('Flow name is required')
+      return
+    }
     const flow = buildFlow()
     if (onSave) {
       onSave(flow)
@@ -724,33 +737,37 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
       <div className="flex-1 flex flex-col">
         {/* Top Toolbar */}
         <div className="border-b bg-gray-50 px-4 py-2 space-y-2">
-          {/* Row 1 — Flow ID + Name inputs */}
+          {/* Row 1 — Flow Name + Client */}
           <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs font-medium text-gray-600 whitespace-nowrap">Flow ID</label>
-              {flowId ? (
-                <input
-                  value={flowId}
-                  disabled
-                  className="input text-sm h-8 w-44 bg-gray-100 cursor-not-allowed"
-                />
-              ) : (
-                <input
-                  value={customFlowId}
-                  onChange={(e) => setCustomFlowId(e.target.value)}
-                  placeholder={generatedId.current}
-                  className="input text-sm h-8 w-44 font-mono"
-                />
-              )}
-            </div>
             <div className="flex items-center gap-1.5 flex-1">
               <label className="text-xs font-medium text-gray-600 whitespace-nowrap">Flow Name</label>
-              <input
-                value={flowName}
-                onChange={(e) => setFlowName(e.target.value)}
-                placeholder="My Flow"
-                className="input text-sm h-8 flex-1 max-w-xs"
-              />
+              <div className="flex flex-col flex-1 max-w-xs">
+                <input
+                  value={flowName}
+                  onChange={(e) => {
+                    const snake = e.target.value
+                      .toLowerCase()
+                      .replace(/\s+/g, '_')
+                      .replace(/[^a-z0-9_]/g, '')
+                    setFlowName(snake)
+                    if (!snake.trim()) {
+                      setNameError('Flow name is required')
+                    } else if (!/^[a-z_][a-z0-9_]*$/.test(snake)) {
+                      setNameError('Must be snake_case (lowercase letters, digits, underscores)')
+                    } else {
+                      const duplicate = existingFlows.find(
+                        (f) => f.name === snake && f.id !== (flowId || generatedId.current)
+                      )
+                      setNameError(duplicate ? `Name "${snake}" is already taken` : null)
+                    }
+                  }}
+                  placeholder="my_flow_name"
+                  className={`input text-sm h-8 font-mono ${nameError ? 'border-red-400' : ''}`}
+                />
+                {nameError && (
+                  <span className="text-xs text-red-500 mt-0.5">{nameError}</span>
+                )}
+              </div>
             </div>
             <div className="flex items-center gap-1.5">
               <label className="text-xs font-medium text-gray-600 whitespace-nowrap">Client</label>
@@ -774,7 +791,7 @@ export function FlowDesigner({ flowId, onSave, initialFlow }: {
 
           {/* Row 2 — Action buttons */}
           <div className="flex items-center gap-2">
-            <button onClick={handleSave} disabled={saving} className="btn btn-primary flex items-center gap-1.5 text-sm h-8">
+            <button onClick={handleSave} disabled={saving || !!nameError || !flowName.trim()} className="btn btn-primary flex items-center gap-1.5 text-sm h-8">
               <Save className="w-3.5 h-3.5" />
               {saving ? (flowId ? 'Updating…' : 'Saving…') : (flowId ? 'Update Flow' : 'Save Flow')}
             </button>
