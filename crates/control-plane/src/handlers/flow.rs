@@ -234,9 +234,13 @@ pub async fn create_flow(
 ) -> Result<Json<Value>, AppError> {
     tracing::info!("📡 Creating flow: {}", flow.name);
 
-    sqlx::query("INSERT INTO flow_definitions (name, client_id, config) VALUES ($1, $2, $3)")
+    let project_uuid = flow.project_id.as_deref()
+        .and_then(|id| uuid::Uuid::parse_str(id).ok());
+
+    sqlx::query("INSERT INTO flow_definitions (name, client_id, project_id, config) VALUES ($1, $2, $3, $4)")
         .bind(&flow.name)
         .bind(&flow.client_id)
+        .bind(project_uuid)
         .bind(serde_json::to_value(&flow).unwrap())
         .execute(&state.db)
         .await.map_err(|e| AppError::Internal(format!("Database error: {}", e)))?;
@@ -275,9 +279,13 @@ pub async fn update_flow(
         return Err(AppError::Internal("Flow ID mismatch".to_string()));
     }
 
-    sqlx::query("UPDATE flow_definitions SET name = $1, client_id = $2, config = $3 WHERE config->>'id' = $4")
+    let project_uuid = flow.project_id.as_deref()
+        .and_then(|pid| uuid::Uuid::parse_str(pid).ok());
+
+    sqlx::query("UPDATE flow_definitions SET name = $1, client_id = $2, project_id = $3, config = $4 WHERE config->>'id' = $5")
         .bind(&flow.name)
         .bind(&flow.client_id)
+        .bind(project_uuid)
         .bind(serde_json::to_value(&flow).unwrap())
         .bind(&id)
         .execute(&state.db)

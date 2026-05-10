@@ -1,6 +1,7 @@
 import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom'
 import { Login } from './pages/Login'
 import { Dashboard } from './pages/Dashboard'
+import { Projects } from './pages/Projects'
 import { Flows } from './pages/Flows'
 import { FlowEditor } from './pages/FlowEditor'
 import { Connectors } from './pages/Connectors'
@@ -43,7 +44,8 @@ function App() {
             </SetupGuard>
           }
         >
-          <Route index element={<Navigate to="/dashboard" replace />} />
+          <Route index element={<Navigate to="/projects" replace />} />
+          <Route path="projects" element={<Projects />} />
           <Route path="dashboard" element={<Dashboard />} />
           <Route path="flows" element={<Flows />} />
           <Route path="flows/:id" element={<FlowEditor />} />

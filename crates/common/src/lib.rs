@@ -204,6 +204,17 @@ pub enum EdgeCondition {
     Expression,
 }
 
+/// Project groups related flows together
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Project {
+    pub id: String,
+    pub name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flow_count: Option<i64>,
+}
+
 /// Flow definition
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FlowDefinition {
@@ -212,6 +223,9 @@ pub struct FlowDefinition {
     /// Client that owns this flow — only this client may execute or manage it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
+    /// Project this flow belongs to
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     pub trigger: Trigger,
     /// Graph-based execution model (preferred)
     #[serde(default)]

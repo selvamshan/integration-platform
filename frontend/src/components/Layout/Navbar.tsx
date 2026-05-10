@@ -48,7 +48,8 @@ export function Navbar() {
         <div className="flex justify-between items-center h-16">
           {/* Left nav */}
           <div className="flex gap-6 items-center">
-            <Link to="/dashboard" className="font-bold text-xl">Integration Platform</Link>
+            <Link to="/projects"    className="font-bold text-xl">Integration Platform</Link>
+            <Link to="/projects"    className="text-sm hover:text-primary-600">Projects</Link>
             <Link to="/flows"       className="text-sm hover:text-primary-600">Flows</Link>
             <Link to="/connectors"  className="text-sm hover:text-primary-600">Connectors</Link>
             <Link to="/audit-logs"  className="text-sm hover:text-primary-600">Audit Logs</Link>

@@ -6,3 +6,4 @@ pub mod connector_instance;
 pub mod auth;
 pub mod user;
 pub mod rate_limit;
+pub mod project;

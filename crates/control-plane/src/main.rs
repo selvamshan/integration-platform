@@ -47,6 +47,7 @@ use handlers::auth::{create_client, list_clients, get_client, delete_client, tog
 use handlers::user::{invite_user, list_users, delete_user, get_current_user};
 use handlers::rate_limit::{get_rate_limit_stats, get_flow_rate_limit_stats};
 use handlers::flow::{list_flows, test_flow, get_flow, create_flow, delete_flow, update_flow};
+use handlers::project::{list_projects, create_project, get_project, delete_project, list_project_flows};
 
 use services::flow_sync::flow_sync_service;
 use services::connector_sync::connector_instance_sync_service;
@@ -144,8 +145,10 @@ async fn main() -> Result<()> {
         }
     });
 
+    let frontend_url = std::env::var("FRONTEND_URL")
+        .unwrap_or_else(|_| "http://localhost:3000".to_string());
     let cors = CorsLayer::new()
-        .allow_origin("http://localhost:3000".parse::<HeaderValue>().unwrap())
+        .allow_origin(frontend_url.parse::<HeaderValue>().unwrap())
         .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE, Method::OPTIONS])
         .allow_headers([
             header::AUTHORIZATION,
@@ -161,6 +164,10 @@ async fn main() -> Result<()> {
         // API routes
         .route("/apis",     get(list_apis).post(create_api))
         .route("/apis/:id", get(get_api))
+        // Project routes
+        .route("/projects",             get(list_projects).post(create_project))
+        .route("/projects/:id",         get(get_project).delete(delete_project))
+        .route("/projects/:id/flows",   get(list_project_flows))
         // Flow routes
         .route("/flows",     get(list_flows).post(create_flow))
         .route("/flows/:id", get(get_flow).put(update_flow).delete(delete_flow))

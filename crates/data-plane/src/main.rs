@@ -74,8 +74,48 @@ async fn main() -> Result<()> {
     let executor = FlowExecutor::new();
 
     let scheduler = Arc::new(FlowScheduler::new("UTC").await?);
-    scheduler.start().await?;
-    tracing::info!("✅ Flow scheduler started");
+
+    // Only one instance should run scheduled flows. Acquire a Redis lock with a
+    // 30-second TTL and renew it in the background; if this node loses the lock
+    // (e.g. after a crash + restart) another instance will take over.
+    let is_scheduler_leader = {
+        let mut conn = redis.clone();
+        let acquired: bool = redis::cmd("SET")
+            .arg("scheduler-leader")
+            .arg(&node_id)
+            .arg("NX")
+            .arg("PX")
+            .arg(30_000u64)
+            .query_async(&mut conn)
+            .await
+            .unwrap_or(false);
+        if acquired {
+            let mut renew_conn = redis.clone();
+            let renew_id = node_id.clone();
+            tokio::spawn(async move {
+                let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
+                loop {
+                    interval.tick().await;
+                    let result: redis::RedisResult<()> = redis::cmd("PEXPIRE")
+                        .arg("scheduler-leader")
+                        .arg(30_000u64)
+                        .query_async(&mut renew_conn)
+                        .await;
+                    if result.is_err() {
+                        tracing::warn!("Scheduler leader lock renewal failed for {}", renew_id);
+                    }
+                }
+            });
+        }
+        acquired
+    };
+
+    if is_scheduler_leader {
+        scheduler.start().await?;
+        tracing::info!("✅ Flow scheduler started (leader: {})", node_id);
+    } else {
+        tracing::info!("⏭️  Flow scheduler skipped (not leader)");
+    }
 
     tracing::info!("✅ HTTP connector initialized (DB connectors registered on-demand)");
 
