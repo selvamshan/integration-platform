@@ -1,5 +1,7 @@
 # Integration Platform
 
+[![License: AGPL v3](https://img.shields.io/badge/License-AGPL_v3-blue.svg)](LICENSE)
+
 A production-grade integration platform built in Rust, providing a visual flow designer, multi-database connectors, event-driven architecture, and enterprise security features.
 
 ## Overview
@@ -451,4 +453,6 @@ See [building_aid/TROUBLESHOOTING.md](building_aid/TROUBLESHOOTING.md) for detai
 
 ## License
 
-MIT
+Licensed under the [GNU Affero General Public License v3.0](LICENSE).
+
+If you use this software to provide a hosted or managed service, you must make your complete source code available to users under the same license.
