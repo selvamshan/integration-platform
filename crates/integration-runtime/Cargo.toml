@@ -20,3 +20,6 @@ oracle = "0.5"
 futures = { workspace = true }
 tiberius = { version = "0.12", default-features = false, features = ["tokio", "native-tls"] }
 tokio-util = { version = "0.7", features = ["compat"] }
+aws-sdk-s3 = "1"
+aws-config = { version = "1", features = ["behavior-version-latest"] }
+aws-credential-types = { version = "1", features = ["hardcoded-credentials"] }

@@ -1,0 +1,18 @@
+:root {
+    --sidebar-width: 260px;
+}
+
+.sidebar .chapter li a {
+    font-size: 0.88em;
+}
+
+/* Make tables scroll horizontally on small screens */
+table {
+    display: block;
+    overflow-x: auto;
+}
+
+/* Tighten code blocks */
+pre {
+    border-radius: 4px;
+}

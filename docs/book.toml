@@ -1,0 +1,18 @@
+[book]
+title = "Integration Platform"
+description = "A production-grade Rust integration platform with visual flow designer, multi-database connectors, and enterprise security"
+authors = ["Selvaraj"]
+language = "en"
+src = "src"
+
+[output.html]
+site-url = "/integration-platform/"
+git-repository-url = "https://github.com/selvamshan/integration-platform"
+edit-url-template = "https://github.com/selvamshan/integration-platform/edit/main/docs/src/{path}"
+additional-css = ["theme/custom.css"]
+no-section-label = false
+
+[output.html.search]
+enable = true
+limit-results = 20
+teaser-word-count = 30
