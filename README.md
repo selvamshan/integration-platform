@@ -225,6 +225,31 @@ curl -X POST http://localhost:8080/flows/sync-orders/execute \
   -d '{"since": "2024-01-01"}'
 ```
 
+## Frontend Navigation
+
+The React UI ([http://localhost:5173](http://localhost:5173)) is route-based (`react-router-dom`); the navbar exposes the routes below based on authentication and role.
+
+| Route | Page | Access | Description |
+|---|---|---|---|
+| `/setup` | Setup | Public | First-run wizard to configure the OIDC provider (Keycloak / Auth0 / Okta) |
+| `/login` | Login | Public (requires setup) | Sign in via the configured identity provider |
+| `/projects` | Projects | Authenticated | Default landing page; create/manage tenant-isolated projects |
+| `/dashboard` | Dashboard | Authenticated | Summary cards for flows, connectors, and recent executions |
+| `/flows` | Flows | Authenticated | List, create, and delete integration flows |
+| `/flows/:id` | Flow Editor | Authenticated | Drag-and-drop React Flow canvas for building a flow's steps/graph |
+| `/flows/:id/runs` | Flow Runs | Authenticated | Execution history and live run status for a flow |
+| `/connectors` | Connectors | Authenticated | Register and manage connector instances (HTTP, Postgres, MySQL, MSSQL, Oracle, S3) |
+| `/audit-logs` | Audit Logs | Authenticated | Searchable audit trail of platform actions |
+| `/users` | Users | Admin only | Manage platform users and role assignments (via Admin dropdown) |
+| `/clients` | API Clients | Admin only | Manage API client credentials (via Admin dropdown) |
+
+Navigation rules:
+
+- `/setup` redirects to itself until an identity provider is configured; all other routes redirect to `/setup` until that's done.
+- Unauthenticated requests to any protected route redirect to `/login`.
+- `/users` and `/clients` are only reachable through the **Admin** dropdown in the navbar, shown to users with the `admin` role.
+- The top-level layout ([Layout.tsx](frontend/src/components/Layout/Layout.tsx)) renders the [Navbar](frontend/src/components/Layout/Navbar.tsx) plus an `<Outlet />` for the active page.
+
 ## API Reference
 
 ### Control Plane (`:8081`)
@@ -430,26 +455,14 @@ docker-compose up --build
 cargo build --release
 ```
 
-See [building_aid/TROUBLESHOOTING.md](building_aid/TROUBLESHOOTING.md) for detailed solutions.
+See the [Troubleshooting guide](https://selvamshan.github.io/integration-platform/guides/troubleshooting.html) for detailed solutions.
 
-## Additional Guides
+## Documentation
 
-| Guide | Topic |
-|---|---|
-| [QUICKSTART.md](building_aid/QUICKSTART.md) | Step-by-step first run |
-| [HTTP-CONNECTOR-GUIDE.md](building_aid/HTTP-CONNECTOR-GUIDE.md) | HTTP connector details |
-| [GRAPH_EXECUTOR.md](building_aid/GRAPH_EXECUTOR.md) | DAG-based flow execution |
-| [CIRCUIT-BREAKER.md](building_aid/CIRCUIT-BREAKER.md) | Circuit breaker configuration |
-| [RATE-LIMITING.md](building_aid/RATE-LIMITING.md) | Rate limiting setup |
-| [METRICS.md](building_aid/METRICS.md) | Prometheus & Grafana setup |
-| [RBAC-SETUP.md](building_aid/RBAC-SETUP.md) | Role-based access control |
-| [RBAC-KEYCLOAK.md](building_aid/RBAC-KEYCLOAK.md) | Keycloak SSO integration |
-| [SCHEDULER-QUICK-START.md](building_aid/SCHEDULER-QUICK-START.md) | Cron-triggered flows |
-| [EVENT-DRIVEN-ARCHITECTURE.md](building_aid/EVENT-DRIVEN-ARCHITECTURE.md) | NATS event bus internals |
-| [DEPLOYMENT.md](building_aid/DEPLOYMENT.md) | Production deployment |
-| [AWS-DEPLOYMENT.md](building_aid/AWS-DEPLOYMENT.md) | AWS deployment guide |
-| [AUDIT-LOG-IMPLEMENTATION.md](building_aid/AUDIT-LOG-IMPLEMENTATION.md) | Audit logging details |
-| [TRANSFORMATION-GUIDE.md](building_aid/TRANSFORMATION-GUIDE.md) | Data transformation reference |
+Full guides (installation, connectors, RBAC, rate limiting, circuit breaker,
+metrics, deployment, and more) are published at
+[selvamshan.github.io/integration-platform](https://selvamshan.github.io/integration-platform/),
+built from [docs/src](docs/src/SUMMARY.md).
 
 ## License
 

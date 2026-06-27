@@ -36,6 +36,7 @@
 
 # Guides
 
+- [Frontend Navigation](./guides/frontend-navigation.md)
 - [Building Flows](./guides/flows.md)
 - [RBAC & Keycloak SSO](./guides/rbac.md)
 - [Rate Limiting](./guides/rate-limiting.md)
